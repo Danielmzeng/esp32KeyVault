@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../components")
+set(TEST_COMPONENTS vault_crypto vault_store vault vault_session)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(esp32key_tests)

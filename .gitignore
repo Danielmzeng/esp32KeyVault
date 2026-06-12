@@ -1,0 +1,25 @@
+# ESP-IDF build output
+build/
+**/build/
+
+# Managed components (restored from dependencies.lock)
+managed_components/
+**/managed_components/
+
+# Generated sdkconfig (sdkconfig.defaults is tracked)
+sdkconfig
+sdkconfig.old
+**/sdkconfig
+**/sdkconfig.old
+
+# Editor / tooling state
+.vscode/
+.claude/
+
+# Build scratch logs / helpers
+*.log
+build_log*.txt
+test_app_build*.txt
+test_app_set_target.txt
+_*.txt
+_*.bat
