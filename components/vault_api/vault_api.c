@@ -1,6 +1,7 @@
 #include "vault_api.h"
 #include "vault.h"
 #include "vault_session.h"
+#include "status_led.h"
 #include "esp_https_server.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -15,8 +16,6 @@ static httpd_handle_t s_srv;   /* for the idle-lock timer to queue work onto */
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
-extern const uint8_t vault_png_start[]  asm("_binary_vault_png_start");
-extern const uint8_t vault_png_end[]    asm("_binary_vault_png_end");
 
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
 
@@ -82,7 +81,6 @@ static esp_err_t h_static(httpd_req_t *r, const uint8_t *start, const uint8_t *e
     return httpd_resp_send(r, (const char *)start, end - start);
 }
 static esp_err_t h_index(httpd_req_t *r){ return h_static(r,index_html_start,index_html_end,"text/html"); }
-static esp_err_t h_logo(httpd_req_t *r){ return h_static(r,vault_png_start,vault_png_end,"image/png"); }
 
 /* ---- /api/state ---- */
 static esp_err_t h_state(httpd_req_t *r)
@@ -362,6 +360,25 @@ static esp_err_t h_export(httpd_req_t *r)
     return st;
 }
 
+/* ---- POST /api/reset ---- body {transfer_password}; deletes every entry.
+ * Gated by the transfer password (same intent gate as export), not just the
+ * session cookie, since it is irreversible. Categories and the master/transfer
+ * passwords are preserved — the vault stays set up and unlocked. */
+static esp_err_t h_reset(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r,401,"unauthorized");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    const char *tpw = json_str(j,"transfer_password");
+    bool ok = vault_verify_transfer(tpw, strlen(tpw));
+    cJSON_Delete(j);
+    if (!ok) return err_json(r,403,"wrong transfer password");
+    if (vault_clear_entries() != ESP_OK) return err_json(r,500,"reset failed");
+    cJSON *o = cJSON_CreateObject(); cJSON_AddBoolToObject(o,"ok",true);
+    return send_json(r,200,o);
+}
+
 /* ---- POST /api/import ---- body is a plaintext export file
  * {format,version,entries:[{title,username,url,secret,comment,category}]}.
  * Merge: an imported entry replaces a local one with the same title+username;
@@ -448,6 +465,17 @@ static void idle_timer_cb(void *arg)
     if (s_srv) httpd_queue_work(s_srv, idle_lock_work, NULL);
 }
 
+/* URI matcher wrapper: the one chokepoint every request routes through. Pulse
+ * the activity LED whenever a request matches an /api/ route, so the indicator
+ * lives in a single place instead of every handler. Runs on the httpd task and
+ * only sets a flag, so it adds nothing to the handler hot path. */
+static bool uri_match_activity(const char *tpl, const char *uri, size_t upto)
+{
+    bool m = httpd_uri_match_wildcard(tpl, uri, upto);
+    if (m && strncmp(tpl, "/api/", 5) == 0) status_led_activity();
+    return m;
+}
+
 esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
                           const char *key_pem, size_t key_len)
 {
@@ -463,7 +491,7 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
     cfg.prvtkey_pem = (const uint8_t *)key_pem;
     cfg.prvtkey_len = key_len;
     cfg.httpd.max_uri_handlers = 20;
-    cfg.httpd.uri_match_fn = httpd_uri_match_wildcard;
+    cfg.httpd.uri_match_fn = uri_match_activity;
     /* Pin the server (TLS handshake + all API handlers) to CPU1, away from the
      * USB+Wi-Fi+system tasks that are all pinned to CPU0. */
     cfg.httpd.core_id = 1;
@@ -474,7 +502,6 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
 
     const httpd_uri_t routes[] = {
         {"/",                       HTTP_GET,    h_index,         NULL},
-        {"/vault.png",              HTTP_GET,    h_logo,          NULL},
         {"/api/state",              HTTP_GET,    h_state,         NULL},
         {"/api/setup",              HTTP_POST,   h_setup,         NULL},
         {"/api/login",              HTTP_POST,   h_login,         NULL},
@@ -482,6 +509,7 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
         {"/api/change-password",    HTTP_POST,   h_change_pw,     NULL},
         {"/api/export",             HTTP_POST,   h_export,        NULL},
         {"/api/import",             HTTP_POST,   h_import,        NULL},
+        {"/api/reset",              HTTP_POST,   h_reset,         NULL},
         {"/api/entries",            HTTP_GET,    h_entries_list,  NULL},
         {"/api/entries",            HTTP_POST,   h_entries_add,   NULL},
         {"/api/entries/*",          HTTP_GET,    h_entry_secret,  NULL},

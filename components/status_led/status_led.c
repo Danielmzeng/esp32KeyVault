@@ -10,12 +10,16 @@
 #define REFRESH_US      (150 * 1000)   /* mirror vault state; also the busy-blink rate */
 #define LVL             24             /* dim: per-channel level, 0-255 */
 #define G_MIN           1              /* darkest still-lit green (idle window nearly up) */
+#define ACT_TICKS       2              /* ~0.3s blue pulse per API request */
 
 static const char *TAG = "status_led";
 static led_strip_handle_t s_strip;
 static int      s_last = -1;           /* last state drawn; skip redundant refreshes */
 static uint32_t s_glevel;              /* last green level drawn (unlocked fade) */
 static bool     s_blink;               /* toggles each tick while busy */
+static volatile int s_activity;        /* >0: remaining blue activity-pulse ticks */
+
+void status_led_activity(void) { s_activity = ACT_TICKS; }
 
 static void set_rgb(uint32_t r, uint32_t g, uint32_t b)
 {
@@ -57,6 +61,12 @@ static void tick(void *arg)
         s_blink = !s_blink;
         set_rgb(s_blink ? LVL : 0, 0, 0);
         s_last = -1;                   /* force a redraw of the steady state when done */
+        return;
+    }
+    if (s_activity > 0) {              /* API activity: brief blue pulse over the state */
+        s_activity--;
+        set_rgb(0, 0, LVL);
+        s_last = -1;                   /* force a steady-state redraw when the pulse ends */
         return;
     }
     int code = state_code();

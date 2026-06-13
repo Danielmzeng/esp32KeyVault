@@ -10,3 +10,9 @@
  * reflected without any hook in the request handlers. Call once after
  * vault_init(). Returns ESP_OK even if the LED is absent; it just won't light. */
 esp_err_t status_led_init(void);
+
+/* Pulse the LED blue briefly to signal API activity (any request handled),
+ * then return to mirroring the steady vault state. Safe to call from any task:
+ * it only sets a flag the LED timer reads, so no LED I/O races -- and because
+ * the timer renders it, a slow/busy request handler can't suppress the pulse. */
+void status_led_activity(void);

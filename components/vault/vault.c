@@ -403,6 +403,14 @@ esp_err_t vault_delete(uint8_t id)
     return ESP_ERR_NOT_FOUND;
 }
 
+esp_err_t vault_clear_entries(void)
+{
+    if (!s_unlocked) return ESP_ERR_INVALID_STATE;
+    memset(s_entries, 0, s_count * sizeof *s_entries);   /* wipe plaintext fields */
+    s_count = 0;
+    return persist_entries();
+}
+
 /* ---- categories CRUD ---- */
 
 static uint8_t alloc_cat_id(void)

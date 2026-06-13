@@ -52,6 +52,9 @@ esp_err_t vault_update(uint8_t id, const char *title, const char *username,
                        const char *secret, const char *url, const char *comment,
                        uint8_t category_id);
 esp_err_t vault_delete(uint8_t id);
+/* Delete every entry at once. Keeps categories and the master/transfer
+ * passwords — this empties the vault, it does not factory-reset it. */
+esp_err_t vault_clear_entries(void);
 
 /* Categories — require unlocked vault. The built-in "Uncategorized" (id 0) is
  * implicit and not returned by vault_category_list. */
