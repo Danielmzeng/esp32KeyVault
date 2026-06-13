@@ -31,6 +31,7 @@ static vault_entry_t   *s_entries;       /* VAULT_MAX_ENTRIES */
 static uint8_t         *s_io_plain;      /* PLAIN_MAX */
 static uint8_t         *s_io_blob;       /* BLOB_MAX */
 static size_t           s_count;
+static bool             s_bulk;          /* defer entry persistence (import) */
 
 static vault_category_t s_cats[VAULT_MAX_CATEGORIES];
 static size_t           s_cat_count;
@@ -88,6 +89,7 @@ static size_t serialize_entries(uint8_t *plain)
 
 static esp_err_t persist_entries(void)
 {
+    if (s_bulk) return ESP_OK;   /* inside a bulk window; vault_bulk_commit flushes */
     size_t off = serialize_entries(s_io_plain);
     uint8_t *nonce = s_io_blob, *tag = s_io_blob + VC_NONCE_LEN, *ct = s_io_blob + ENTRIES_HDR;
     vc_random(nonce, VC_NONCE_LEN);
@@ -96,6 +98,18 @@ static esp_err_t persist_entries(void)
     err = vs_set_blob("entries", s_io_blob, ENTRIES_HDR + off);
     if (err == ESP_OK) err = vs_commit();
     return err;
+}
+
+/* Bulk-edit window: vault_add/vault_update keep changes in RAM and skip their
+ * per-call NVS commit until vault_bulk_commit() writes once. Lets import avoid
+ * one flash erase/write cycle per entry and stay all-or-nothing on disk. */
+void vault_bulk_begin(void) { s_bulk = true; }
+
+esp_err_t vault_bulk_commit(void)
+{
+    s_bulk = false;
+    if (!s_unlocked) return ESP_ERR_INVALID_STATE;
+    return persist_entries();
 }
 
 static esp_err_t load_entries(void)

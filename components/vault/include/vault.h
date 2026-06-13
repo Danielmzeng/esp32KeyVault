@@ -68,6 +68,13 @@ bool      vault_verify_transfer(const char *pw, size_t len);
 esp_err_t vault_export(const char *transfer_pw, size_t len,
                        uint8_t **out_bundle, size_t *out_len);
 
+/* Bulk-edit window for import: while open, vault_add/vault_update mutate the
+ * in-RAM table but defer the NVS commit; vault_bulk_commit() persists once (and
+ * closes the window). Always pair begin with commit, even on the error path, or
+ * later writes stay deferred. */
+void      vault_bulk_begin(void);
+esp_err_t vault_bulk_commit(void);
+
 /* Import a bundle (decrypted with the supplied transfer password) and merge:
  * an imported entry replaces a local one with the same title+username; others
  * are added. Requires unlocked vault. Returns ESP_FAIL on wrong password. */

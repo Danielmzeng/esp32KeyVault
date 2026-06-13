@@ -377,8 +377,8 @@ static esp_err_t h_export(httpd_req_t *r)
         cJSON_AddStringToObject(e,"comment",comment);
         cJSON_AddStringToObject(e,"category",cname);
         cJSON_AddItemToArray(arr,e);
-        /* Don't leave plaintext secrets on the stack between iterations. */
-        memset(secret, 0, sizeof secret); memset(comment, 0, sizeof comment);
+        /* Don't leave plaintext on the stack between iterations. */
+        memset(secret, 0, sizeof secret); memset(url, 0, sizeof url); memset(comment, 0, sizeof comment);
     }
     free(list);
 
@@ -402,7 +402,11 @@ static esp_err_t h_export(httpd_req_t *r)
 static esp_err_t h_import(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
-    char *body = read_body_cap(r, 96 * 1024); if (!body) return err_json(r,400,"bad body");
+    /* Must exceed the largest file h_export can produce, or the device can't
+     * re-import its own export. Worst case: every char of every field escapes to
+     * \uXXXX (6 bytes); ~6*VAULT_MAX_ENTRIES*6*VAULT_FIELD_MAX plus structure,
+     * which is ~300 KB. 384 KB leaves headroom and is cheap from PSRAM. */
+    char *body = read_body_cap(r, 384 * 1024); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     cJSON *arr = cJSON_GetObjectItem(j,"entries");
@@ -415,6 +419,10 @@ static esp_err_t h_import(httpd_req_t *r)
     static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
     vault_category_list(cats, VAULT_MAX_CATEGORIES, &cn);
 
+    /* One NVS commit for the whole import, not one per entry: faster, far less
+     * flash wear, and all-or-nothing on disk (a crash mid-loop leaves the old
+     * vault, not a half-merged one). */
+    vault_bulk_begin();
     int imported = 0;
     cJSON *e;
     cJSON_ArrayForEach(e, arr) {
@@ -452,7 +460,9 @@ static esp_err_t h_import(httpd_req_t *r)
         }
         if (re == ESP_OK) imported++;
     }
+    esp_err_t pe = vault_bulk_commit();
     free(list); cJSON_Delete(j);
+    if (pe != ESP_OK) return err_json(r,500,"import save failed");
     cJSON *o = cJSON_CreateObject(); cJSON_AddNumberToObject(o,"imported",imported);
     return send_json(r, 200, o);
 }
