@@ -5,6 +5,8 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -12,10 +14,8 @@ static const char *TAG = "vault_api";
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
-extern const uint8_t app_js_start[]     asm("_binary_app_js_start");
-extern const uint8_t app_js_end[]       asm("_binary_app_js_end");
-extern const uint8_t style_css_start[]  asm("_binary_style_css_start");
-extern const uint8_t style_css_end[]    asm("_binary_style_css_end");
+extern const uint8_t vault_png_start[]  asm("_binary_vault_png_start");
+extern const uint8_t vault_png_end[]    asm("_binary_vault_png_end");
 
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
 
@@ -113,8 +113,7 @@ static esp_err_t h_static(httpd_req_t *r, const uint8_t *start, const uint8_t *e
     return httpd_resp_send(r, (const char *)start, end - start);
 }
 static esp_err_t h_index(httpd_req_t *r){ return h_static(r,index_html_start,index_html_end,"text/html"); }
-static esp_err_t h_appjs(httpd_req_t *r){ return h_static(r,app_js_start,app_js_end,"application/javascript"); }
-static esp_err_t h_css(httpd_req_t *r){ return h_static(r,style_css_start,style_css_end,"text/css"); }
+static esp_err_t h_logo(httpd_req_t *r){ return h_static(r,vault_png_start,vault_png_end,"image/png"); }
 
 /* ---- /api/state ---- */
 static esp_err_t h_state(httpd_req_t *r)
@@ -131,6 +130,12 @@ static const char *json_str(cJSON *root, const char *k)
     return cJSON_IsString(i) ? i->valuestring : "";
 }
 
+static int json_int(cJSON *root, const char *k)
+{
+    cJSON *i = cJSON_GetObjectItem(root, k);
+    return cJSON_IsNumber(i) ? i->valueint : 0;
+}
+
 /* ---- /api/setup ---- */
 static esp_err_t h_setup(httpd_req_t *r)
 {
@@ -142,6 +147,9 @@ static esp_err_t h_setup(httpd_req_t *r)
     if (strlen(pw) == 0 || strlen(tpw) == 0) { cJSON_Delete(j); return err_json(r,400,"both passwords required"); }
     esp_err_t e = vault_setup(pw, strlen(pw));
     if (e != ESP_OK) { cJSON_Delete(j); return err_json(r,400,"already initialized"); }
+    /* Two back-to-back PBKDF2 derivations on this task; yield so the idle task
+     * runs and the task watchdog is satisfied between them. */
+    vTaskDelay(pdMS_TO_TICKS(20));
     e = vault_set_transfer_password(tpw, strlen(tpw));
     if (e != ESP_OK) { vault_factory_reset(); cJSON_Delete(j); return err_json(r,500,"setup failed, try again"); }
     cJSON_Delete(j);
@@ -189,6 +197,7 @@ static esp_err_t h_entries_list(httpd_req_t *r)
     cJSON *o = cJSON_CreateObject(); cJSON *arr = cJSON_AddArrayToObject(o,"entries");
     for (size_t i=0;i<n;i++){ cJSON *e=cJSON_CreateObject();
         cJSON_AddNumberToObject(e,"id",list[i].id);
+        cJSON_AddNumberToObject(e,"category",list[i].category_id);
         cJSON_AddStringToObject(e,"title",list[i].title);
         cJSON_AddStringToObject(e,"username",list[i].username);
         cJSON_AddItemToArray(arr,e); }
@@ -203,7 +212,9 @@ static esp_err_t h_entries_add(httpd_req_t *r)
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     uint8_t id;
-    esp_err_t e = vault_add(json_str(j,"title"), json_str(j,"username"), json_str(j,"secret"), &id);
+    esp_err_t e = vault_add(json_str(j,"title"), json_str(j,"username"), json_str(j,"secret"),
+                            json_str(j,"url"), json_str(j,"comment"),
+                            (uint8_t)json_int(j,"category"), &id);
     cJSON_Delete(j);
     if (e != ESP_OK) return err_json(r,400,"add failed");
     cJSON *o=cJSON_CreateObject(); cJSON_AddNumberToObject(o,"id",id);
@@ -222,10 +233,20 @@ static int uri_id(httpd_req_t *r)
 static esp_err_t h_entry_secret(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
+    /* Trailing-wildcard route (matcher only honors a final asterisk), so require
+     * the "/secret" suffix so only reveal requests reach this handler. */
+    size_t ulen = strlen(r->uri);
+    const char suf[] = "/secret";
+    size_t slen = sizeof suf - 1;
+    if (ulen < slen || strcmp(r->uri + ulen - slen, suf) != 0)
+        return err_json(r,404,"not found");
     int id = uri_id(r); if (id < 0) return err_json(r,400,"bad id");
-    char secret[VAULT_FIELD_MAX];
-    if (vault_reveal((uint8_t)id, secret) != ESP_OK) return err_json(r,404,"not found");
-    cJSON *o=cJSON_CreateObject(); cJSON_AddStringToObject(o,"secret",secret);
+    char secret[VAULT_FIELD_MAX], url[VAULT_FIELD_MAX], comment[VAULT_FIELD_MAX];
+    if (vault_reveal((uint8_t)id, secret, url, comment) != ESP_OK) return err_json(r,404,"not found");
+    cJSON *o=cJSON_CreateObject();
+    cJSON_AddStringToObject(o,"secret",secret);
+    cJSON_AddStringToObject(o,"url",url);
+    cJSON_AddStringToObject(o,"comment",comment);
     return send_json(r, 200, o);
 }
 
@@ -237,9 +258,59 @@ static esp_err_t h_entry_update(httpd_req_t *r)
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
-    esp_err_t e = vault_update((uint8_t)id, json_str(j,"title"), json_str(j,"username"), json_str(j,"secret"));
+    esp_err_t e = vault_update((uint8_t)id, json_str(j,"title"), json_str(j,"username"),
+                               json_str(j,"secret"), json_str(j,"url"), json_str(j,"comment"),
+                               (uint8_t)json_int(j,"category"));
     cJSON_Delete(j);
     if (e != ESP_OK) return err_json(r,404,"not found");
+    return send_json(r, 200, cJSON_CreateObject());
+}
+
+/* ---- GET /api/categories ---- */
+static esp_err_t h_cats_list(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r,401,"unauthorized");
+    static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t n = 0;
+    if (vault_category_list(cats, VAULT_MAX_CATEGORIES, &n) != ESP_OK) return err_json(r,403,"locked");
+    cJSON *o = cJSON_CreateObject(); cJSON *arr = cJSON_AddArrayToObject(o,"categories");
+    for (size_t i=0;i<n;i++){ cJSON *c=cJSON_CreateObject();
+        cJSON_AddNumberToObject(c,"id",cats[i].id);
+        cJSON_AddStringToObject(c,"name",cats[i].name);
+        cJSON_AddItemToArray(arr,c); }
+    return send_json(r, 200, o);
+}
+
+/* ---- POST /api/categories ---- body {name} */
+static esp_err_t h_cats_add(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r,401,"unauthorized");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    const char *name = json_str(j,"name");
+    uint8_t id;
+    esp_err_t e = vault_category_add(name, &id);
+    cJSON_Delete(j);
+    if (e == ESP_ERR_INVALID_STATE) return err_json(r,409,"category exists");
+    if (e != ESP_OK) return err_json(r,400,"add failed");
+    cJSON *o=cJSON_CreateObject(); cJSON_AddNumberToObject(o,"id",id);
+    return send_json(r, 200, o);
+}
+
+/* Parse trailing numeric id from a "/api/categories/{id}" URI. */
+static int uri_cat_id(httpd_req_t *r)
+{
+    const char *p = strstr(r->uri, "/api/categories/");
+    if (!p) return -1;
+    return atoi(p + strlen("/api/categories/"));
+}
+
+/* ---- DELETE /api/categories/{id} ---- */
+static esp_err_t h_cat_delete(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r,401,"unauthorized");
+    int id = uri_cat_id(r); if (id <= 0) return err_json(r,400,"bad id");
+    if (vault_category_delete((uint8_t)id) != ESP_OK) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
@@ -309,6 +380,12 @@ static esp_err_t h_import(httpd_req_t *r)
 esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
                           const char *key_pem, size_t key_len)
 {
+    /* Clients rejecting our self-signed cert (and OS captive-portal probes)
+     * abort the TLS handshake; that is expected, so don't spam it as errors. */
+    esp_log_level_set("esp-tls-mbedtls", ESP_LOG_NONE);
+    esp_log_level_set("esp_https_server", ESP_LOG_WARN);
+    esp_log_level_set("httpd", ESP_LOG_ERROR);
+
     httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
     cfg.servercert = (const uint8_t *)cert_pem;
     cfg.servercert_len = cert_len;
@@ -323,8 +400,7 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
 
     const httpd_uri_t routes[] = {
         {"/",                       HTTP_GET,    h_index,         NULL},
-        {"/style.css",              HTTP_GET,    h_css,           NULL},
-        {"/app.js",                 HTTP_GET,    h_appjs,         NULL},
+        {"/vault.png",              HTTP_GET,    h_logo,          NULL},
         {"/api/state",              HTTP_GET,    h_state,         NULL},
         {"/api/setup",              HTTP_POST,   h_setup,         NULL},
         {"/api/login",              HTTP_POST,   h_login,         NULL},
@@ -334,9 +410,12 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
         {"/api/import",             HTTP_POST,   h_import,        NULL},
         {"/api/entries",            HTTP_GET,    h_entries_list,  NULL},
         {"/api/entries",            HTTP_POST,   h_entries_add,   NULL},
-        {"/api/entries/*/secret",   HTTP_GET,    h_entry_secret,  NULL},
+        {"/api/entries/*",          HTTP_GET,    h_entry_secret,  NULL},
         {"/api/entries/*",          HTTP_PUT,    h_entry_update,  NULL},
         {"/api/entries/*",          HTTP_DELETE, h_entry_delete,  NULL},
+        {"/api/categories",         HTTP_GET,    h_cats_list,     NULL},
+        {"/api/categories",         HTTP_POST,   h_cats_add,      NULL},
+        {"/api/categories/*",       HTTP_DELETE, h_cat_delete,    NULL},
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++)
         httpd_register_uri_handler(srv, &routes[i]);
