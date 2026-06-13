@@ -116,7 +116,8 @@ function paint() {
       <div class=err id=ce></div>
       <div class=row style="margin-top:.6rem"><button id=xfer>Transfer</button>
         <button id=lock>Lock</button></div>
-      <div class=row style="margin-top:.4rem"><button id=reset>Reset</button></div>
+      <div class=row style="margin-top:.4rem"><button id=clear>Clear Entries</button>
+        <button id=reset>Reset</button></div>
     </div>
     <div class=main>
       <h2>${sel==='all'?'All entries':esc(catName(sel))}</h2>
@@ -201,13 +202,14 @@ function paint() {
     catch(e){ $('#e').textContent = e.message; }
   };
   $('#xfer').onclick = renderTransfer;
+  $('#clear').onclick = renderClear;
   $('#reset').onclick = renderReset;
   $('#lock').onclick = async()=>{ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); };
 }
 
-function renderReset() {
+function renderClear() {
   $('#app').innerHTML = `<img class=logo src="${LOGO}" alt="esp32key">
-    <h2>Reset</h2>
+    <h2>Clear entries</h2>
     <p class=warn>This permanently deletes <b>all entries</b>. Categories and your passwords are kept. This cannot be undone.</p>
     <input id=rpw type=password placeholder="Transfer password">
     <button id=go>Delete all entries</button>
@@ -220,6 +222,32 @@ function renderReset() {
       sel = 'all'; renderVault(); }
     catch(e){ $('#e').textContent = e.message; }
   };
+}
+
+function renderReset() {
+  $('#app').innerHTML = `<img class=logo src="${LOGO}" alt="esp32key">
+    <h2>Reset keys</h2>
+    <h3>Change master password</h3>
+    <input id=mc type=password placeholder="Current master password">
+    <input id=mn type=password placeholder="New master password">
+    <button id=gom>Change master password</button>
+    <div class=err id=me></div>
+    <h3>Change transfer password</h3>
+    <input id=tc type=password placeholder="Current transfer password">
+    <input id=tn type=password placeholder="New transfer password">
+    <button id=got>Change transfer password</button>
+    <div class=err id=te></div>
+    <div class=row style="margin-top:.6rem"><button id=back>Back</button></div>`;
+  $('#back').onclick = renderVault;
+  const rotate = async (path, curEl, newEl, msgEl) => {
+    try {
+      await api(path,{method:'POST',body:JSON.stringify({current:$(curEl).value, next:$(newEl).value})});
+      $(msgEl).style.color = '#070'; $(msgEl).textContent = 'Changed.';
+      $(curEl).value = $(newEl).value = '';
+    } catch(e){ $(msgEl).style.color = '#b00'; $(msgEl).textContent = e.message; }
+  };
+  $('#gom').onclick = () => rotate('/api/change-password','#mc','#mn','#me');
+  $('#got').onclick = () => rotate('/api/change-transfer','#tc','#tn','#te');
 }
 
 function renderTransfer() {

@@ -304,6 +304,25 @@ static esp_err_t h_change_pw(httpd_req_t *r)
     return send_json(r, 200, cJSON_CreateObject());
 }
 
+/* ---- POST /api/change-transfer ---- body {current, next}; rotate the transfer
+ * password. Mirrors change-password: requires the unlocked session plus the
+ * correct current transfer password. */
+static esp_err_t h_change_transfer(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r,401,"unauthorized");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    const char *cur = json_str(j,"current"), *next = json_str(j,"next");
+    esp_err_t e = ESP_FAIL;
+    bool ok = vault_verify_transfer(cur, strlen(cur));
+    if (ok) e = vault_set_transfer_password(next, strlen(next));
+    cJSON_Delete(j);
+    if (!ok) return err_json(r,403,"wrong transfer password");
+    if (e != ESP_OK) return err_json(r,400,"change failed");
+    return send_json(r, 200, cJSON_CreateObject());
+}
+
 /* ---- POST /api/export ---- body {transfer_password}; returns a PLAINTEXT JSON
  * file of every entry, for migrating into another password manager. The transfer
  * password is still required as an intent gate, but the file is NOT encrypted:
@@ -507,6 +526,7 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
         {"/api/login",              HTTP_POST,   h_login,         NULL},
         {"/api/logout",             HTTP_POST,   h_logout,        NULL},
         {"/api/change-password",    HTTP_POST,   h_change_pw,     NULL},
+        {"/api/change-transfer",    HTTP_POST,   h_change_transfer, NULL},
         {"/api/export",             HTTP_POST,   h_export,        NULL},
         {"/api/import",             HTTP_POST,   h_import,        NULL},
         {"/api/reset",              HTTP_POST,   h_reset,         NULL},
