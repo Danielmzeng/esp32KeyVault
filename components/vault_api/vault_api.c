@@ -11,6 +11,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "vault_api";
+static httpd_handle_t s_srv;   /* for the idle-lock timer to queue work onto */
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
@@ -62,38 +63,6 @@ static char *read_body_cap(httpd_req_t *r, size_t maxlen)
     return buf;
 }
 static char *read_body(httpd_req_t *r) { return read_body_cap(r, 2048); }
-
-static int b64_sextet(unsigned char c)
-{
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
-
-/* Decode base64 src into dst (capacity dcap). Returns decoded byte count, or
- * -1 on invalid input / overflow. Skips ASCII whitespace; '=' ends input. */
-static int b64_decode(const char *src, size_t slen, uint8_t *dst, size_t dcap)
-{
-    uint32_t acc = 0; int nbits = 0; size_t out = 0;
-    for (size_t i = 0; i < slen; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '=') break;
-        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
-        int v = b64_sextet(c);
-        if (v < 0) return -1;
-        acc = (acc << 6) | (uint32_t)v;
-        nbits += 6;
-        if (nbits >= 8) {
-            nbits -= 8;
-            if (out >= dcap) return -1;
-            dst[out++] = (uint8_t)((acc >> nbits) & 0xFF);
-        }
-    }
-    return (int)out;
-}
 
 /* Extract and validate our session cookie. httpd_req_get_cookie_val parses the
  * named cookie with framework-maintained RFC handling and reads only the "sid"
@@ -467,6 +436,18 @@ static esp_err_t h_import(httpd_req_t *r)
     return send_json(r, 200, o);
 }
 
+/* Auto-lock idle sessions. An esp_timer callback runs on the timer task, but
+ * vault/session state is otherwise only ever touched from the httpd task and is
+ * not synchronized -- so the timer hands the check to the httpd task via
+ * httpd_queue_work, keeping it serialized with request handlers. */
+static void idle_lock_work(void *arg) { (void)arg; vsess_check_idle(now_ms()); }
+
+static void idle_timer_cb(void *arg)
+{
+    (void)arg;
+    if (s_srv) httpd_queue_work(s_srv, idle_lock_work, NULL);
+}
+
 esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
                           const char *key_pem, size_t key_len)
 {
@@ -512,5 +493,17 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++)
         httpd_register_uri_handler(srv, &routes[i]);
+
+    /* Auto-lock after VS_IDLE_MS (3 min). Poll every 5 s so the lock (and the
+     * LED's switch to red) lands promptly after the green fade bottoms out; the
+     * lock itself runs on the httpd task (see idle_timer_cb) so it can't race a
+     * live handler. */
+    s_srv = srv;
+    const esp_timer_create_args_t idle_args = { .callback = idle_timer_cb, .name = "idle_lock" };
+    esp_timer_handle_t idle_t;
+    if (esp_timer_create(&idle_args, &idle_t) == ESP_OK)
+        esp_timer_start_periodic(idle_t, 5ULL * 1000 * 1000);
+    else
+        ESP_LOGW(TAG, "idle-lock timer failed; vault still locks lazily on next request");
     return ESP_OK;
 }
