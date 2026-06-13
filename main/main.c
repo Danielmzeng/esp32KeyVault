@@ -9,6 +9,7 @@
 #include "net_wifi_ap.h"
 #include "net_usb.h"
 #include "vault_api.h"
+#include "status_led.h"
 #include <stdlib.h>
 
 static const char *TAG = "esp32key";
@@ -21,6 +22,7 @@ void app_main(void)
     ESP_ERROR_CHECK(vc_init());
     ESP_ERROR_CHECK(vs_init());
     ESP_ERROR_CHECK(vault_init());   /* auto-reset if the on-disk format changed */
+    status_led_init();               /* WS2812 vault indicator: blue=setup, red=locked, green=unlocked */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 

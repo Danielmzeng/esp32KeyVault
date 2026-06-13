@@ -1,0 +1,4 @@
+dependencies:
+  # 3.x is the line compatible with ESP-IDF v6; 2.5.5 fails to compile (missing
+  # heap_caps include in its SPI backend).
+  espressif/led_strip: "^3.0.0"

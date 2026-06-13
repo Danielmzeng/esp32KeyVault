@@ -30,6 +30,7 @@ esp_err_t vault_init(void);
 
 bool      vault_is_initialized(void);   /* has setup ever run? */
 bool      vault_is_unlocked(void);
+bool      vault_is_busy(void);          /* a slow PBKDF2 derivation (unlock) is in progress */
 
 esp_err_t vault_setup(const char *master, size_t master_len);   /* first run */
 esp_err_t vault_unlock(const char *master, size_t master_len);  /* ESP_ERR_INVALID_STATE if not init; ESP_FAIL if wrong pw */

@@ -32,6 +32,7 @@ static uint8_t         *s_io_plain;      /* PLAIN_MAX */
 static uint8_t         *s_io_blob;       /* BLOB_MAX */
 static size_t           s_count;
 static bool             s_bulk;          /* defer entry persistence (import) */
+static volatile bool    s_deriving;      /* a slow PBKDF2 key derivation is running */
 
 static vault_category_t s_cats[VAULT_MAX_CATEGORIES];
 static size_t           s_cat_count;
@@ -40,6 +41,7 @@ static size_t serialize_entries(uint8_t *plain);
 static esp_err_t persist_cats(void);
 
 bool vault_is_unlocked(void) { return s_unlocked; }
+bool vault_is_busy(void)     { return s_deriving; }
 
 bool vault_is_initialized(void)
 {
@@ -226,7 +228,11 @@ esp_err_t vault_unlock(const char *master, size_t mlen)
     if (!vault_is_initialized()) return ESP_ERR_INVALID_STATE;
     if (ensure_buffers() != ESP_OK) return ESP_ERR_NO_MEM;
     uint8_t kek[VC_KEY_LEN];
-    if (load_kek(master, mlen, kek) != ESP_OK) return ESP_FAIL;
+    /* PBKDF2 here is the ~1s wait; flag it so the status LED can blink "working". */
+    s_deriving = true;
+    esp_err_t ke = load_kek(master, mlen, kek);
+    s_deriving = false;
+    if (ke != ESP_OK) return ESP_FAIL;
     uint8_t wdek[VC_WRAPPED_DEK_LEN]; size_t wlen = sizeof wdek;
     if (vs_get_blob("wdek", wdek, &wlen) != ESP_OK) return ESP_FAIL;
     if (vc_dek_unwrap(kek, wdek, s_dek) != ESP_OK) return ESP_FAIL;  /* wrong pw */

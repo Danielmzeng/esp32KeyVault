@@ -19,8 +19,10 @@ Built with ESP-IDF v6.0.1.
 - Add / edit / delete credentials; secrets revealed per-entry on demand.
 - Change the master password without re-encrypting every entry.
 - Device-to-device export/import, protected by a separate transfer password.
-- Session hardening: HttpOnly + Secure + SameSite cookie, idle auto-lock, and
-  login rate-limiting / lockout.
+- Session hardening: HttpOnly + Secure + SameSite cookie, 3-minute idle
+  auto-lock (actively enforced), and login rate-limiting / lockout.
+- Onboard RGB status LED indicating vault state, with a green fade counting
+  down to idle auto-lock (see [Status LED](#status-led)).
 
 ## Security model
 
@@ -46,6 +48,9 @@ on first boot and stored on the device — your browser will show a one-time
 
 - An ESP32-S3 dev board with PSRAM and at least 4 MB flash.
 - A USB cable (also used for the USB network interface).
+- Optional: an onboard WS2812 ("NeoPixel") RGB LED for the status indicator —
+  GPIO48 on the ESP32-S3-DevKitC-1 (some boards use GPIO38). The vault runs fine
+  without one.
 
 PSRAM defaults to Octal mode (`CONFIG_SPIRAM_MODE_OCT`). If your module uses
 Quad PSRAM, change that in `sdkconfig.defaults` and delete `sdkconfig` to
@@ -84,6 +89,29 @@ The first build compiles all of ESP-IDF and can take 10-20 minutes.
 5. Transfer screen: enter the transfer password to download an encrypted export
    file, or to import a file exported from another device.
 
+## Status LED
+
+If the board has an onboard WS2812 RGB LED (GPIO48), it shows the vault's
+security state at a glance, at low brightness:
+
+| LED               | Meaning                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| **Blue**          | No vault yet — run first-time setup                            |
+| **Red**           | Locked                                                         |
+| **Blinking red**  | Unlocking — the PBKDF2 key derivation takes ~1 s               |
+| **Green**         | Unlocked                                                       |
+
+While unlocked, the green **fades from bright to dark over the 3-minute idle
+window** as auto-lock approaches; any web-UI activity resets it to full
+brightness. When the idle timer expires the vault auto-locks (the DEK is wiped
+from RAM) and the LED returns to **red**.
+
+The indicator is driven by the `status_led` component, which mirrors live vault
+state on a timer — no per-request hooks. The pin is `LED_GPIO` in
+`components/status_led/status_led.c`; change it to `38` for boards that wire the
+LED there. If LED init fails the vault still runs normally, just without the
+indicator.
+
 ## Project layout
 
 ```
@@ -92,6 +120,7 @@ components/
   vault_store/    NVS persistence
   vault/          credential model: setup/unlock/lock/CRUD, change-pw, export/import
   vault_session/  session tokens, idle timeout, login lockout
+  status_led/     onboard WS2812 status indicator (vault state + idle countdown)
   vault_cert/     self-signed TLS cert generation + persistence
   net_wifi_ap/    WiFi softAP bring-up
   net_usb/        TinyUSB NCM network interface + DHCP server
