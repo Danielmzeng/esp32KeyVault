@@ -13,8 +13,15 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # USB OTG + TinyUSB networking (NCM)
 CONFIG_TINYUSB_NET_MODE_NCM=y
 
+# Pin the TinyUSB device task to CPU0 (defaults to CPU1 on the dual-core S3).
+CONFIG_TINYUSB_TASK_AFFINITY_CPU0=y
+
 # HTTPS server enabled (TLS-server side is gated by MBEDTLS_TLS_SERVER, on by default in v6)
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# Pin the lwIP TCP/IP task to CPU1, alongside the httpd server, so the whole
+# network-serving path is isolated from the USB+Wi-Fi+system tasks on CPU0.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
 
 # Give mbedTLS room for cert generation
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

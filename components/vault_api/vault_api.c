@@ -337,7 +337,11 @@ static esp_err_t h_change_pw(httpd_req_t *r)
     return send_json(r, 200, cJSON_CreateObject());
 }
 
-/* ---- POST /api/export ---- body {transfer_password}; returns binary bundle */
+/* ---- POST /api/export ---- body {transfer_password}; returns a PLAINTEXT JSON
+ * file of every entry, for migrating into another password manager. The transfer
+ * password is still required as an intent gate, but the file is NOT encrypted:
+ * all secrets are in clear text. Category is emitted by name so it survives a
+ * round-trip into a vault with different category ids. */
 static esp_err_t h_export(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
@@ -345,36 +349,112 @@ static esp_err_t h_export(httpd_req_t *r)
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     const char *tpw = json_str(j,"transfer_password");
-    uint8_t *bundle = NULL; size_t blen = 0;
-    esp_err_t e = vault_export(tpw, strlen(tpw), &bundle, &blen);
+    bool ok = vault_verify_transfer(tpw, strlen(tpw));
     cJSON_Delete(j);
-    if (e != ESP_OK) return err_json(r,403,"wrong transfer password");
-    httpd_resp_set_type(r, "application/octet-stream");
-    httpd_resp_set_hdr(r, "Content-Disposition", "attachment; filename=esp32key-export.bin");
-    esp_err_t s = httpd_resp_send(r, (const char *)bundle, blen);
-    free(bundle);
-    return s;
+    if (!ok) return err_json(r,403,"wrong transfer password");
+
+    vault_entry_t *list = malloc(VAULT_MAX_ENTRIES * sizeof *list);
+    if (!list) return err_json(r,500,"oom");
+    size_t n = 0;
+    if (vault_list(list, VAULT_MAX_ENTRIES, &n) != ESP_OK) { free(list); return err_json(r,403,"locked"); }
+    static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
+    vault_category_list(cats, VAULT_MAX_CATEGORIES, &cn);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o,"format","esp32key-export");
+    cJSON_AddNumberToObject(o,"version",1);
+    cJSON *arr = cJSON_AddArrayToObject(o,"entries");
+    for (size_t i = 0; i < n; i++) {
+        char secret[VAULT_FIELD_MAX], url[VAULT_FIELD_MAX], comment[VAULT_FIELD_MAX];
+        if (vault_reveal(list[i].id, secret, url, comment) != ESP_OK) { secret[0]=url[0]=comment[0]='\0'; }
+        const char *cname = "";
+        for (size_t k = 0; k < cn; k++) if (cats[k].id == list[i].category_id) { cname = cats[k].name; break; }
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddStringToObject(e,"title",list[i].title);
+        cJSON_AddStringToObject(e,"username",list[i].username);
+        cJSON_AddStringToObject(e,"url",url);
+        cJSON_AddStringToObject(e,"secret",secret);
+        cJSON_AddStringToObject(e,"comment",comment);
+        cJSON_AddStringToObject(e,"category",cname);
+        cJSON_AddItemToArray(arr,e);
+        /* Don't leave plaintext secrets on the stack between iterations. */
+        memset(secret, 0, sizeof secret); memset(comment, 0, sizeof comment);
+    }
+    free(list);
+
+    char *s = cJSON_Print(o);   /* pretty: the file is meant to be human-readable */
+    cJSON_Delete(o);
+    if (!s) return err_json(r,500,"oom");
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Content-Disposition", "attachment; filename=esp32key-export.json");
+    esp_err_t st = httpd_resp_sendstr(r, s);
+    memset(s, 0, strlen(s));    /* wipe the rendered cleartext before freeing */
+    free(s);
+    return st;
 }
 
-/* ---- POST /api/import ---- body {transfer_password, bundle(base64)} */
+/* ---- POST /api/import ---- body is a plaintext export file
+ * {format,version,entries:[{title,username,url,secret,comment,category}]}.
+ * Merge: an imported entry replaces a local one with the same title+username;
+ * others are added. Category is matched by name; unknown -> Uncategorized.
+ * No transfer password: the file is already plaintext and the session cookie
+ * already grants full write access. */
 static esp_err_t h_import(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body_cap(r, 96 * 1024); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
-    const char *tpw = json_str(j,"transfer_password");
-    const char *b64 = json_str(j,"bundle");
-    size_t b64len = strlen(b64);
-    size_t cap = (b64len / 4) * 3 + 4;
-    uint8_t *raw = malloc(cap);
-    if (!raw) { cJSON_Delete(j); return err_json(r,400,"oom"); }
-    int rc = b64_decode(b64, b64len, raw, cap);
-    if (rc < 0) { free(raw); cJSON_Delete(j); return err_json(r,400,"import failed (wrong password or bad file)"); }
-    esp_err_t e = vault_import(tpw, strlen(tpw), raw, (size_t)rc);
-    free(raw); cJSON_Delete(j);
-    if (e != ESP_OK) return err_json(r,400,"import failed (wrong password or bad file)");
-    return send_json(r, 200, cJSON_CreateObject());
+    cJSON *arr = cJSON_GetObjectItem(j,"entries");
+    if (!cJSON_IsArray(arr)) { cJSON_Delete(j); return err_json(r,400,"no entries in file"); }
+
+    vault_entry_t *list = malloc(VAULT_MAX_ENTRIES * sizeof *list);
+    if (!list) { cJSON_Delete(j); return err_json(r,500,"oom"); }
+    size_t n = 0;
+    if (vault_list(list, VAULT_MAX_ENTRIES, &n) != ESP_OK) { free(list); cJSON_Delete(j); return err_json(r,403,"locked"); }
+    static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
+    vault_category_list(cats, VAULT_MAX_CATEGORIES, &cn);
+
+    int imported = 0;
+    cJSON *e;
+    cJSON_ArrayForEach(e, arr) {
+        const char *title = json_str(e,"title");
+        const char *user  = json_str(e,"username");
+        if (title[0] == '\0') continue;           /* a title is required */
+        const char *url   = json_str(e,"url");
+        const char *sec   = json_str(e,"secret");
+        const char *cmt   = json_str(e,"comment");
+        const char *cname = json_str(e,"category");
+
+        uint8_t cat = 0;
+        if (cname[0]) for (size_t k = 0; k < cn; k++)
+            if (strncmp(cats[k].name, cname, VAULT_CAT_NAME_MAX) == 0) { cat = cats[k].id; break; }
+
+        /* Match against the live set (incl. entries added earlier this loop) so a
+         * file with duplicate title+username collapses instead of duplicating. */
+        int match_id = -1;
+        for (size_t i = 0; i < n; i++)
+            if (strncmp(list[i].title, title, VAULT_FIELD_MAX) == 0 &&
+                strncmp(list[i].username, user, VAULT_FIELD_MAX) == 0) { match_id = list[i].id; break; }
+
+        esp_err_t re;
+        if (match_id >= 0) {
+            re = vault_update((uint8_t)match_id, title, user, sec, url, cmt, cat);
+        } else {
+            uint8_t nid;
+            re = vault_add(title, user, sec, url, cmt, cat, &nid);
+            if (re == ESP_OK && n < VAULT_MAX_ENTRIES) {
+                list[n].id = nid;
+                strlcpy(list[n].title, title, VAULT_FIELD_MAX);
+                strlcpy(list[n].username, user, VAULT_FIELD_MAX);
+                n++;
+            }
+        }
+        if (re == ESP_OK) imported++;
+    }
+    free(list); cJSON_Delete(j);
+    cJSON *o = cJSON_CreateObject(); cJSON_AddNumberToObject(o,"imported",imported);
+    return send_json(r, 200, o);
 }
 
 esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
@@ -393,6 +473,9 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
     cfg.prvtkey_len = key_len;
     cfg.httpd.max_uri_handlers = 20;
     cfg.httpd.uri_match_fn = httpd_uri_match_wildcard;
+    /* Pin the server (TLS handshake + all API handlers) to CPU1, away from the
+     * USB+Wi-Fi+system tasks that are all pinned to CPU0. */
+    cfg.httpd.core_id = 1;
 
     httpd_handle_t srv = NULL;
     esp_err_t e = httpd_ssl_start(&srv, &cfg);
