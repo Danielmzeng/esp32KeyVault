@@ -16,7 +16,14 @@ static uint8_t s_dek[VC_KEY_LEN];
 /* In-RAM working copy, valid only while unlocked. */
 static vault_entry_t s_entries[VAULT_MAX_ENTRIES];
 static size_t s_count;
-static uint8_t s_next_id = 1;
+
+/* Shared scratch buffers. The vault is single-threaded (one request at a time),
+ * so persist/load/export/import reuse these instead of each owning its own
+ * ~24 KB static buffer. */
+static uint8_t s_io_plain[PLAIN_MAX];
+static uint8_t s_io_blob[ENTRIES_HDR + PLAIN_MAX];
+
+static size_t serialize_entries(uint8_t *plain);
 
 bool vault_is_unlocked(void) { return s_unlocked; }
 
@@ -30,13 +37,16 @@ static esp_err_t load_kek(const char *master, size_t mlen, uint8_t kek[VC_KEY_LE
 {
     uint8_t salt[VC_SALT_LEN]; size_t slen = sizeof salt;
     if (vs_get_blob("salt", salt, &slen) != ESP_OK) return ESP_ERR_INVALID_STATE;
-    return vc_derive_key(master, mlen, salt, ITERATIONS, kek);
+    /* Use the iteration count stored at setup; fall back to the current default
+     * if absent. This keeps old vaults unlockable if ITERATIONS is ever bumped. */
+    uint32_t iter = ITERATIONS; size_t ilen = sizeof iter;
+    vs_get_blob("iter", &iter, &ilen);
+    return vc_derive_key(master, mlen, salt, iter, kek);
 }
 
-/* Encrypt s_entries -> NVS "entries". */
-static esp_err_t persist_entries(void)
+/* Serialize s_entries into plain[] as packed [id(1)][title][username][secret]. */
+static size_t serialize_entries(uint8_t *plain)
 {
-    static uint8_t plain[PLAIN_MAX];
     size_t off = 0;
     for (size_t i = 0; i < s_count; i++) {
         plain[off++] = s_entries[i].id;
@@ -44,12 +54,18 @@ static esp_err_t persist_entries(void)
         memcpy(plain + off, s_entries[i].username,  VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
         memcpy(plain + off, s_entries[i].secret,    VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
     }
-    static uint8_t blob[ENTRIES_HDR + PLAIN_MAX];
-    uint8_t *nonce = blob, *tag = blob + VC_NONCE_LEN, *ct = blob + ENTRIES_HDR;
+    return off;
+}
+
+/* Encrypt s_entries -> NVS "entries". */
+static esp_err_t persist_entries(void)
+{
+    size_t off = serialize_entries(s_io_plain);
+    uint8_t *nonce = s_io_blob, *tag = s_io_blob + VC_NONCE_LEN, *ct = s_io_blob + ENTRIES_HDR;
     vc_random(nonce, VC_NONCE_LEN);
-    esp_err_t err = vc_gcm_encrypt(s_dek, nonce, NULL, 0, plain, off, ct, tag);
+    esp_err_t err = vc_gcm_encrypt(s_dek, nonce, NULL, 0, s_io_plain, off, ct, tag);
     if (err != ESP_OK) return err;
-    err = vs_set_blob("entries", blob, ENTRIES_HDR + off);
+    err = vs_set_blob("entries", s_io_blob, ENTRIES_HDR + off);
     if (err == ESP_OK) err = vs_commit();
     return err;
 }
@@ -57,27 +73,25 @@ static esp_err_t persist_entries(void)
 /* Decrypt NVS "entries" -> s_entries. Missing blob = empty vault. */
 static esp_err_t load_entries(void)
 {
-    static uint8_t blob[ENTRIES_HDR + PLAIN_MAX];
-    size_t blen = sizeof blob;
-    esp_err_t err = vs_get_blob("entries", blob, &blen);
-    s_count = 0; s_next_id = 1;
+    size_t blen = sizeof s_io_blob;
+    esp_err_t err = vs_get_blob("entries", s_io_blob, &blen);
+    s_count = 0;
     if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
     if (err != ESP_OK) return err;
+    if (blen < ENTRIES_HDR) return ESP_FAIL;   /* truncated/corrupt blob */
 
-    static uint8_t plain[PLAIN_MAX];
-    uint8_t *nonce = blob, *tag = blob + VC_NONCE_LEN, *ct = blob + ENTRIES_HDR;
+    uint8_t *nonce = s_io_blob, *tag = s_io_blob + VC_NONCE_LEN, *ct = s_io_blob + ENTRIES_HDR;
     size_t ctlen = blen - ENTRIES_HDR;
-    err = vc_gcm_decrypt(s_dek, nonce, NULL, 0, ct, ctlen, tag, plain);
+    err = vc_gcm_decrypt(s_dek, nonce, NULL, 0, ct, ctlen, tag, s_io_plain);
     if (err != ESP_OK) return err;
 
     size_t off = 0;
     while (off + REC_SIZE <= ctlen && s_count < VAULT_MAX_ENTRIES) {
         vault_entry_t *e = &s_entries[s_count++];
-        e->id = plain[off++];
-        memcpy(e->title,    plain + off, VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
-        memcpy(e->username, plain + off, VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
-        memcpy(e->secret,   plain + off, VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
-        if (e->id >= s_next_id) s_next_id = e->id + 1;
+        e->id = s_io_plain[off++];
+        memcpy(e->title,    s_io_plain + off, VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
+        memcpy(e->username, s_io_plain + off, VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
+        memcpy(e->secret,   s_io_plain + off, VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
     }
     return ESP_OK;
 }
@@ -98,7 +112,7 @@ esp_err_t vault_setup(const char *master, size_t mlen)
     if ((err = vs_set_blob("wdek", wdek, sizeof wdek)) != ESP_OK) return err;
     if ((err = vs_commit()) != ESP_OK) return err;
 
-    s_unlocked = true; s_count = 0; s_next_id = 1;
+    s_unlocked = true; s_count = 0;
     return persist_entries();
 }
 
@@ -121,6 +135,10 @@ void vault_lock(void)
     s_unlocked = false;
     memset(s_dek, 0, sizeof s_dek);
     memset(s_entries, 0, sizeof s_entries);
+    /* Also wipe the shared scratch buffers: they hold decrypted plaintext /
+     * ciphertext after persist/load/export/import. */
+    memset(s_io_plain, 0, sizeof s_io_plain);
+    memset(s_io_blob, 0, sizeof s_io_blob);
     s_count = 0;
 }
 
@@ -146,8 +164,9 @@ esp_err_t vault_change_password(const char *cur, size_t clen,
     if (vc_dek_unwrap(kek, wdek, dek) != ESP_OK) return ESP_FAIL;  /* wrong current pw */
 
     uint8_t salt[VC_SALT_LEN]; vc_random(salt, sizeof salt);
+    uint32_t iter = ITERATIONS;
     uint8_t nkek[VC_KEY_LEN], nwdek[VC_WRAPPED_DEK_LEN];
-    if (vc_derive_key(next, nlen, salt, ITERATIONS, nkek) != ESP_OK) return ESP_FAIL;
+    if (vc_derive_key(next, nlen, salt, iter, nkek) != ESP_OK) return ESP_FAIL;
     /* Re-wrap the SAME dek under the new kek. */
     uint8_t *nonce = nwdek, *ct = nwdek + VC_NONCE_LEN, *tag = nwdek + VC_NONCE_LEN + VC_KEY_LEN;
     vc_random(nonce, VC_NONCE_LEN);
@@ -155,6 +174,7 @@ esp_err_t vault_change_password(const char *cur, size_t clen,
 
     esp_err_t err;
     if ((err = vs_set_blob("salt", salt, sizeof salt)) != ESP_OK) return err;
+    if ((err = vs_set_blob("iter", &iter, sizeof iter)) != ESP_OK) return err;
     if ((err = vs_set_blob("wdek", nwdek, sizeof nwdek)) != ESP_OK) return err;
     return vs_commit();
 }
@@ -163,6 +183,16 @@ static vault_entry_t *find(uint8_t id)
 {
     for (size_t i = 0; i < s_count; i++) if (s_entries[i].id == id) return &s_entries[i];
     return NULL;
+}
+
+/* Lowest unused entry id in 1..255 (ids are one byte in the record format).
+ * Returns 0 only if all 255 ids are taken — impossible while
+ * VAULT_MAX_ENTRIES <= 64, so callers treat 0 as "no space". */
+static uint8_t alloc_id(void)
+{
+    for (uint16_t cand = 1; cand <= 255; cand++)
+        if (!find((uint8_t)cand)) return (uint8_t)cand;
+    return 0;
 }
 
 static void set_field(char *dst, const char *src)
@@ -196,8 +226,10 @@ esp_err_t vault_add(const char *title, const char *username, const char *secret,
 {
     if (!s_unlocked) return ESP_ERR_INVALID_STATE;
     if (s_count >= VAULT_MAX_ENTRIES) return ESP_ERR_NO_MEM;
+    uint8_t id = alloc_id();
+    if (id == 0) return ESP_ERR_NO_MEM;
     vault_entry_t *e = &s_entries[s_count++];
-    e->id = s_next_id++;
+    e->id = id;
     set_field(e->title, title);
     set_field(e->username, username);
     set_field(e->secret, secret);
@@ -264,32 +296,18 @@ bool vault_verify_transfer(const char *pw, size_t len)
            memcmp(out, XFER_CHECK, 16) == 0;
 }
 
-/* Serialize s_entries into plain[] (same record layout as persist_entries). */
-static size_t serialize_entries(uint8_t *plain)
-{
-    size_t off = 0;
-    for (size_t i = 0; i < s_count; i++) {
-        plain[off++] = s_entries[i].id;
-        memcpy(plain + off, s_entries[i].title,    VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
-        memcpy(plain + off, s_entries[i].username,  VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
-        memcpy(plain + off, s_entries[i].secret,    VAULT_FIELD_MAX); off += VAULT_FIELD_MAX;
-    }
-    return off;
-}
-
 esp_err_t vault_export(const char *transfer_pw, size_t len,
                        uint8_t **out_bundle, size_t *out_len)
 {
     if (!s_unlocked) return ESP_ERR_INVALID_STATE;
     if (!vault_verify_transfer(transfer_pw, len)) return ESP_FAIL;
 
-    static uint8_t plain[PLAIN_MAX];
-    size_t plen = serialize_entries(plain);
+    size_t plen = serialize_entries(s_io_plain);
     size_t cap = VC_BUNDLE_HDR + plen;
     uint8_t *buf = malloc(cap);
     if (!buf) return ESP_ERR_NO_MEM;
     size_t blen = cap;
-    esp_err_t e = vc_bundle_pack(transfer_pw, len, plain, plen, buf, &blen);
+    esp_err_t e = vc_bundle_pack(transfer_pw, len, s_io_plain, plen, buf, &blen);
     if (e != ESP_OK) { free(buf); return e; }
     *out_bundle = buf; *out_len = blen;
     return ESP_OK;
@@ -299,16 +317,15 @@ esp_err_t vault_import(const char *transfer_pw, size_t len,
                        const uint8_t *bundle, size_t bundle_len)
 {
     if (!s_unlocked) return ESP_ERR_INVALID_STATE;
-    static uint8_t plain[PLAIN_MAX];
-    size_t plen = sizeof plain;
-    esp_err_t e = vc_bundle_unpack(transfer_pw, len, bundle, bundle_len, plain, &plen);
+    size_t plen = sizeof s_io_plain;
+    esp_err_t e = vc_bundle_unpack(transfer_pw, len, bundle, bundle_len, s_io_plain, &plen);
     if (e != ESP_OK) return e;   /* wrong password / tamper / bad format */
 
     size_t off = 0;
     while (off + REC_SIZE <= plen) {
-        const char *title = (const char *)(plain + off + 1);
-        const char *user  = (const char *)(plain + off + 1 + VAULT_FIELD_MAX);
-        const char *sec   = (const char *)(plain + off + 1 + 2 * VAULT_FIELD_MAX);
+        const char *title = (const char *)(s_io_plain + off + 1);
+        const char *user  = (const char *)(s_io_plain + off + 1 + VAULT_FIELD_MAX);
+        const char *sec   = (const char *)(s_io_plain + off + 1 + 2 * VAULT_FIELD_MAX);
         off += REC_SIZE;
 
         vault_entry_t *match = NULL;
@@ -321,8 +338,10 @@ esp_err_t vault_import(const char *transfer_pw, size_t len,
         if (match) {
             set_field(match->secret, sec);
         } else if (s_count < VAULT_MAX_ENTRIES) {
+            uint8_t nid = alloc_id();
+            if (nid == 0) break;   /* id space exhausted */
             vault_entry_t *en = &s_entries[s_count++];
-            en->id = s_next_id++;
+            en->id = nid;
             set_field(en->title, title);
             set_field(en->username, user);
             set_field(en->secret, sec);

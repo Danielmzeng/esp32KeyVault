@@ -52,7 +52,7 @@ async function renderVault() {
   $('#add').onclick=async()=>{ await api('/api/entries',{method:'POST',body:JSON.stringify(
     {title:$('#t').value,username:$('#u').value,secret:$('#s').value})}); renderVault(); };
   $('#xfer').onclick = renderTransfer;
-  $('#lock').onclick=async()=>{ await api('/api/logout',{method:'POST'}); boot(); };
+  $('#lock').onclick=async()=>{ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); };
 }
 function renderTransfer() {
   $('#app').innerHTML = `<h2>Transfer</h2>

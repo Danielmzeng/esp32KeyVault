@@ -11,6 +11,12 @@
 
 void  vsess_reset(void);                       /* clear session + fail counter (test aid) */
 
+/* Register a callback invoked when a session expires due to idle timeout
+ * (e.g. vault_lock to wipe the DEK). Keeps this module independent of the vault.
+ * Pass NULL to clear. */
+typedef void (*vsess_expiry_cb_t)(void);
+void  vsess_set_expiry_cb(vsess_expiry_cb_t cb);
+
 /* Login gating. Returns false if currently locked out. */
 bool  vsess_login_allowed(uint64_t now_ms);
 void  vsess_note_login_result(bool success, uint64_t now_ms);

@@ -2,6 +2,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "vault_store.h"
+#include "vault.h"
+#include "vault_session.h"
 #include "vault_cert.h"
 #include "vault_crypto.h"
 #include "net_wifi_ap.h"
@@ -20,6 +22,9 @@ void app_main(void)
     ESP_ERROR_CHECK(vs_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* Wipe the DEK from RAM when a session idles out, not just on explicit logout. */
+    vsess_set_expiry_cb(vault_lock);
 
     ESP_ERROR_CHECK(net_wifi_ap_start(AP_PASSWORD));
     ESP_ERROR_CHECK(net_usb_start());

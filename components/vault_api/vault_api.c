@@ -23,10 +23,17 @@ static esp_err_t send_json(httpd_req_t *r, int status, cJSON *obj)
 {
     char *s = cJSON_PrintUnformatted(obj);
     httpd_resp_set_type(r, "application/json");
-    if (status == 401) httpd_resp_set_status(r, "401 Unauthorized");
-    else if (status == 400) httpd_resp_set_status(r, "400 Bad Request");
-    else if (status == 403) httpd_resp_set_status(r, "403 Forbidden");
-    else if (status == 500) httpd_resp_set_status(r, "500 Internal Server Error");
+    /* httpd_resp_set_status stores the pointer, so only string literals here.
+     * Any non-200 code we don't recognize falls back to 500 so an error is
+     * never silently sent with the default 200 status. */
+    switch (status) {
+        case 200: break;
+        case 400: httpd_resp_set_status(r, "400 Bad Request"); break;
+        case 401: httpd_resp_set_status(r, "401 Unauthorized"); break;
+        case 403: httpd_resp_set_status(r, "403 Forbidden"); break;
+        case 404: httpd_resp_set_status(r, "404 Not Found"); break;
+        default:  httpd_resp_set_status(r, "500 Internal Server Error"); break;
+    }
     esp_err_t e = httpd_resp_sendstr(r, s ? s : "{}");
     free(s); cJSON_Delete(obj);
     return e;
@@ -88,17 +95,14 @@ static int b64_decode(const char *src, size_t slen, uint8_t *dst, size_t dcap)
     return (int)out;
 }
 
-/* Look for our session cookie. */
+/* Extract and validate our session cookie. httpd_req_get_cookie_val parses the
+ * named cookie with framework-maintained RFC handling and reads only the "sid"
+ * value, so it isn't defeated by other cookies or whole-header truncation. */
 static bool authed(httpd_req_t *r)
 {
-    char cookie[128];
-    if (httpd_req_get_hdr_value_str(r, "Cookie", cookie, sizeof cookie) != ESP_OK) return false;
-    char *p = strstr(cookie, "sid=");
-    if (!p) return false;
-    p += 4;
-    char tok[VS_TOKEN_HEX] = {0};
-    size_t i = 0;
-    while (p[i] && p[i] != ';' && i < VS_TOKEN_HEX - 1) { tok[i] = p[i]; i++; }
+    char tok[VS_TOKEN_HEX];
+    size_t len = sizeof tok;
+    if (httpd_req_get_cookie_val(r, "sid", tok, &len) != ESP_OK) return false;
     return vsess_validate(tok, now_ms());
 }
 
@@ -155,6 +159,9 @@ static esp_err_t h_login(httpd_req_t *r)
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     const char *pw = json_str(j,"password");
+    /* Reject empty password before counting it: otherwise empty-body POSTs
+     * would burn the lockout budget and DoS the legitimate user. */
+    if (strlen(pw) == 0) { cJSON_Delete(j); return err_json(r,400,"password required"); }
     esp_err_t e = vault_unlock(pw, strlen(pw));
     cJSON_Delete(j);
     vsess_note_login_result(e == ESP_OK, now_ms());
@@ -168,6 +175,7 @@ static esp_err_t h_login(httpd_req_t *r)
 /* ---- /api/logout ---- */
 static esp_err_t h_logout(httpd_req_t *r)
 {
+    if (!authed(r)) return err_json(r,401,"unauthorized");
     vsess_destroy(); vault_lock();
     return send_json(r, 200, cJSON_CreateObject());
 }

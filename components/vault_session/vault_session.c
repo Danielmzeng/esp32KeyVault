@@ -9,6 +9,10 @@ static uint64_t s_last_seen_ms;
 static int      s_fail_count;
 static uint64_t s_lockout_until_ms;
 
+static vsess_expiry_cb_t s_expiry_cb;
+
+void vsess_set_expiry_cb(vsess_expiry_cb_t cb) { s_expiry_cb = cb; }
+
 static void to_hex(const uint8_t *in, size_t n, char *out)
 {
     static const char d[] = "0123456789abcdef";
@@ -57,7 +61,11 @@ void vsess_create(uint64_t now_ms, char out_token_hex[VS_TOKEN_HEX])
 bool vsess_validate(const char *token_hex, uint64_t now_ms)
 {
     if (!s_active || !token_hex || token_hex[0] == '\0') return false;
-    if (now_ms - s_last_seen_ms > VS_IDLE_MS) { vsess_destroy(); return false; }
+    if (now_ms - s_last_seen_ms > VS_IDLE_MS) {
+        vsess_destroy();
+        if (s_expiry_cb) s_expiry_cb();   /* e.g. vault_lock(): wipe DEK on idle */
+        return false;
+    }
     if (!ct_eq(token_hex, s_token)) return false;
     s_last_seen_ms = now_ms;
     return true;
