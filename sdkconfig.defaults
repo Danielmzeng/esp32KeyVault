@@ -1,0 +1,26 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# PSRAM (Octal on most S3 modules; switch to QUAD if your module is quad)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# Custom partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# USB OTG + TinyUSB networking (NCM)
+CONFIG_TINYUSB_NET_MODE_NCM=y
+
+# HTTPS server enabled (TLS-server side is gated by MBEDTLS_TLS_SERVER, on by default in v6)
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# Give mbedTLS room for cert generation
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# Required for runtime self-signed X.509 cert writing (vault_cert); defaults to n in v6
+CONFIG_MBEDTLS_X509_CREATE_C=y
+
+# Flash size: the partition table requires > 2 MB (factory = 3 MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

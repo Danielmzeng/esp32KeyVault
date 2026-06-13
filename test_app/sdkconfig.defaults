@@ -1,0 +1,12 @@
+# Required by vault_cert: runtime X.509 self-signed certificate creation.
+# MBEDTLS_X509_CREATE_C defaults to 'n' in ESP-IDF v6; it pulls in
+# MBEDTLS_X509_CRT_WRITE_C (the mbedtls_x509write_crt_* API). PK_WRITE_C and
+# PEM_WRITE_C default to 'y' already.
+CONFIG_MBEDTLS_X509_CREATE_C=y
+
+# Required by net_usb: TinyUSB NCM network class.
+CONFIG_TINYUSB_NET_MODE_NCM=y
+
+# Required by vault_api: TLS server + HTTPS server support.
+CONFIG_ESP_TLS_SERVER=y
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
