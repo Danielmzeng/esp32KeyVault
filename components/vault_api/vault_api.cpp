@@ -28,6 +28,10 @@ extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 
 namespace {
 
+/* NVS key for the persisted idle auto-lock window (<=15 chars). Single source
+ * for both the write (h_idle_set_impl) and the boot-load read (start()). */
+static const char IDLE_MS_KEY[] = "idle_ms";
+
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
 
 static esp_err_t send_json(httpd_req_t *r, int status, cJSON *obj)
@@ -154,13 +158,16 @@ esp_err_t ApiServer::h_idle_set_impl(httpd_req_t *r)
     if (!j) return err_json(r,400,"bad json");
     int secs = json_int(j, "seconds");
     cJSON_Delete(j);
-    if (secs < 30 || secs > 3600) return err_json(r,400,"timeout out of range (30-3600s)");
+    /* Validate against the canonical bounds (in ms) so the window is defined in
+     * one place. Checking seconds before multiplying also avoids uint32 overflow. */
+    if (secs < (int)(VS_IDLE_MIN_MS / 1000) || secs > (int)(VS_IDLE_MAX_MS / 1000))
+        return err_json(r,400,"timeout out of range (30-3600s)");
     uint32_t ms = (uint32_t)secs * 1000u;
     /* Persist first: if the NVS write throws (-> 500 via trampoline) the live
      * window is left unchanged, so the RAM value never diverges from what the
      * client was told failed. secs is pre-validated in range, so set_idle_ms
      * stores it as-is. */
-    store_.set_blob("idle_ms", &ms, sizeof ms);
+    store_.set_blob(IDLE_MS_KEY, &ms, sizeof ms);
     store_.commit();
     session_.set_idle_ms(ms);
     return send_json(r, 200, cJSON_CreateObject());
@@ -657,7 +664,7 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     /* Restore a previously-saved idle window; absent key keeps the default. */
     {
         uint32_t saved = 0; size_t len = sizeof saved;
-        try { if (store_.get_blob("idle_ms", &saved, len) && len == sizeof saved)
+        try { if (store_.get_blob(IDLE_MS_KEY, &saved, len) && len == sizeof saved)
                   session_.set_idle_ms(saved); }
         catch (...) { ESP_LOGW(TAG, "idle_ms load failed; using default"); }
     }

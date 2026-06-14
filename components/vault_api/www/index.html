@@ -112,15 +112,15 @@ function paint() {
 
   $('#app').innerHTML = `<div class=layout>
     <div class=side>
-      <img class=logo src="${LOGO}" alt="esp32key">
+      <img class=logo id=logolock src="${LOGO}" alt="esp32key" title="Lock" style="cursor:pointer">
       <div id=catlist>${side}</div>
       <div class=addcat><input id=newcat placeholder="New category" maxlength=31>
         <button id=addcat>+ Add</button></div>
       <div class=err id=ce></div>
-      <div class=row style="margin-top:.6rem"><button id=xfer>Transfer</button>
+      <div class=row style="margin-top:.6rem"><button id=xfer>Transfer Entries</button>
         <button id=lock>Lock</button></div>
       <div class=row style="margin-top:.4rem"><button id=clear>Clear Entries</button>
-        <button id=reset>Reset</button></div>
+        <button id=reset>Reset Device</button></div>
       <div style="margin-top:.6rem">
         <label for=idlesec style="display:block;font-size:.8rem;font-weight:600;color:#555">Auto-lock after (seconds)</label>
         <input id=idlesec type=number min=30 max=3600 step=10>
@@ -230,7 +230,9 @@ function paint() {
   $('#xfer').onclick = renderTransfer;
   $('#clear').onclick = renderClear;
   $('#reset').onclick = renderReset;
-  $('#lock').onclick = async()=>{ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); };
+  const lock = async()=>{ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); };
+  $('#lock').onclick = lock;
+  $('#logolock').onclick = lock;   /* clicking the sidebar logo also locks */
 }
 
 function renderClear() {
