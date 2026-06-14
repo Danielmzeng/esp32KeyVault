@@ -10,3 +10,6 @@ CONFIG_TINYUSB_NET_MODE_NCM=y
 # Required by vault_api: TLS server + HTTPS server support.
 CONFIG_ESP_TLS_SERVER=y
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# Enable C++ exceptions for the C++ port (and doctest, which needs them).
+CONFIG_COMPILER_CXX_EXCEPTIONS=y

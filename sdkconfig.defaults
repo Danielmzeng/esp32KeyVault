@@ -42,3 +42,8 @@ CONFIG_MBEDTLS_X509_CREATE_C=y
 
 # Flash size: the partition table requires > 2 MB (factory = 3 MB)
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Enable C++ exceptions (RTTI left at default-off). The firmware is implemented in
+# C++ and uses exceptions for fault paths; they are caught at every ESP-IDF
+# C-callback boundary (app_main, httpd handlers, esp_timer callbacks).
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
