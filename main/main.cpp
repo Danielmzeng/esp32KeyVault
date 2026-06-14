@@ -48,7 +48,7 @@ extern "C" void app_main(void)
         cert.get(&cert_pem, &clen, &key_pem, &klen);
         ESP_LOGI(TAG, "certificate ready (%u bytes)", (unsigned)clen);
 
-        static vault::ApiServer api(vault, session, led);
+        static vault::ApiServer api(vault, session, led, store);
         api.start(cert_pem, clen, key_pem, klen);
         ESP_LOGI(TAG, "esp32key ready: https://192.168.4.1 (WiFi) / https://10.10.0.1 (USB)");
     } catch (const std::exception& e) {

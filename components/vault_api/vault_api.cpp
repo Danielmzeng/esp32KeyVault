@@ -145,6 +145,23 @@ esp_err_t ApiServer::h_state_impl(httpd_req_t *r)
     return send_json(r, 200, o);
 }
 
+/* ---- POST /api/idle ---- set idle auto-lock window (seconds), authed + persisted */
+esp_err_t ApiServer::h_idle_set_impl(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r, 401, "locked");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    int secs = json_int(j, "seconds");
+    cJSON_Delete(j);
+    if (secs < 30 || secs > 3600) return err_json(r,400,"timeout out of range (30-3600s)");
+    uint32_t ms = (uint32_t)secs * 1000u;
+    session_.set_idle_ms(ms);
+    store_.set_blob("idle_ms", &ms, sizeof ms);   // throws on fault -> 500 via trampoline
+    store_.commit();
+    return send_json(r, 200, cJSON_CreateObject());
+}
+
 /* ---- /api/setup ---- */
 esp_err_t ApiServer::h_setup_impl(httpd_req_t *r)
 {
@@ -564,6 +581,7 @@ void ApiServer::idle_timer_cb(void *arg)
  * static member converts to the plain function pointer httpd expects. */
 namespace vault {
 API_HANDLER(h_state)
+API_HANDLER(h_idle_set)
 API_HANDLER(h_setup)
 API_HANDLER(h_login)
 API_HANDLER(h_logout)
@@ -611,6 +629,7 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     const httpd_uri_t routes[] = {
         {"/",                       HTTP_GET,    h_index,           this},
         {"/api/state",              HTTP_GET,    h_state,           this},
+        {"/api/idle",               HTTP_POST,   h_idle_set,        this},
         {"/api/setup",              HTTP_POST,   h_setup,           this},
         {"/api/login",              HTTP_POST,   h_login,           this},
         {"/api/logout",             HTTP_POST,   h_logout,          this},
@@ -631,7 +650,16 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     for (auto& route : routes)
         httpd_register_uri_handler(srv_, &route);
 
-    /* Auto-lock after VS_IDLE_MS (3 min). Poll every 5 s so the lock (and the
+    /* Restore a previously-saved idle window; absent key keeps the default. */
+    {
+        uint32_t saved = 0; size_t len = sizeof saved;
+        try { if (store_.get_blob("idle_ms", &saved, len) && len == sizeof saved)
+                  session_.set_idle_ms(saved); }
+        catch (...) { ESP_LOGW(TAG, "idle_ms load failed; using default"); }
+    }
+
+    /* Auto-lock after the session idle window (default 3 min, runtime-configurable).
+     * Poll every 5 s so the lock (and the
      * LED's switch to red) lands promptly after the green fade bottoms out; the
      * lock itself runs on the httpd task (see idle_timer_cb) so it can't race a
      * live handler. */

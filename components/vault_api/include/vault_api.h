@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "esp_https_server.h"
 #include "vault.h"
+#include "vault_store.h"
 #include "vault_session.h"
 #include "status_led.h"
 
@@ -9,8 +10,8 @@ namespace vault {
 
 class ApiServer {
 public:
-    ApiServer(Vault& vault, Session& session, StatusLed& led)
-        : vault_(vault), session_(session), led_(led) {}
+    ApiServer(Vault& vault, Session& session, StatusLed& led, Store& store)
+        : vault_(vault), session_(session), led_(led), store_(store) {}
     // Starts the HTTPS server (binds all interfaces). Throws vault::Error on failure.
     void start(const char* cert_pem, size_t cert_len,
                const char* key_pem, size_t key_len);
@@ -21,6 +22,7 @@ private:
 
     // Request-handler implementations (wrapped by static trampolines).
     esp_err_t h_state_impl(httpd_req_t* r);
+    esp_err_t h_idle_set_impl(httpd_req_t* r);
     esp_err_t h_setup_impl(httpd_req_t* r);
     esp_err_t h_login_impl(httpd_req_t* r);
     esp_err_t h_logout_impl(httpd_req_t* r);
@@ -47,6 +49,7 @@ private:
     // and wraps it in try/catch so a throw never escapes into the httpd C stack.
     // A static member converts to the plain function pointer httpd_uri_t wants.
     static esp_err_t h_state(httpd_req_t*);
+    static esp_err_t h_idle_set(httpd_req_t*);
     static esp_err_t h_setup(httpd_req_t*);
     static esp_err_t h_login(httpd_req_t*);
     static esp_err_t h_logout(httpd_req_t*);
@@ -67,6 +70,7 @@ private:
     Vault&     vault_;
     Session&   session_;
     StatusLed& led_;
+    Store&     store_;
     httpd_handle_t srv_ = nullptr;
 };
 
