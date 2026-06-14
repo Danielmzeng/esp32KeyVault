@@ -34,7 +34,8 @@ namespace {
 static const char IDLE_MS_KEY[] = "idle_ms";
 
 /* One-shot esp_timer callback: reboot so a saved AP-credential change takes
- * effect. Armed ~1.5 s out so the HTTP 200 flushes before the restart. */
+ * effect. Armed ~2 s out (after the 200 is sent) so the HTTP response flushes
+ * before the restart. */
 static void reboot_cb(void*) { esp_restart(); }
 
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
