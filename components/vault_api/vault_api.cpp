@@ -535,7 +535,7 @@ void ApiServer::idle_timer_cb(void *arg)
  * r->user_ctx, calls the matching _impl member, and maps any exception to a
  * 500 JSON error so a throw can never escape into the httpd C stack. */
 #define API_HANDLER(NAME)                                                       \
-    static esp_err_t NAME(httpd_req_t* r) {                                      \
+    esp_err_t ApiServer::NAME(httpd_req_t* r) {                                  \
         auto* self = static_cast<ApiServer*>(r->user_ctx);                       \
         try { return self->NAME##_impl(r); }                                     \
         catch (const vault::Error& e) { return err_json(r, 500, e.what()); }     \
@@ -543,9 +543,9 @@ void ApiServer::idle_timer_cb(void *arg)
         catch (...) { return err_json(r, 500, "internal error"); }               \
     }
 
-/* These live at vault namespace scope (not anonymous) so the `friend` declarations
- * in the class refer to the same entities; `static` still gives them internal
- * linkage. */
+/* The trampolines are static members of ApiServer (declared in the header), so
+ * they reach the private *_impl members directly -- no friend needed -- and a
+ * static member converts to the plain function pointer httpd expects. */
 namespace vault {
 API_HANDLER(h_state)
 API_HANDLER(h_setup)
