@@ -62,20 +62,29 @@ static void generate(Store& store, char **cert_pem, size_t *cert_len,
     unsigned char crtbuf[1024] = {0};
     const unsigned char serial[] = {0x01};
 
-    /* SubjectAltName chain: hostname + both service IPs. Declared up front so no
-     * goto-to-cleanup jumps over an initializer. */
-    mbedtls_x509_san_list san_usb = {
-        .node = { .type = MBEDTLS_X509_SAN_IP_ADDRESS,
-                  .san.unstructured_name = { .p = (unsigned char *)SAN_IP_USB, .len = 4 } },
-        .next = NULL };
-    mbedtls_x509_san_list san_wifi = {
-        .node = { .type = MBEDTLS_X509_SAN_IP_ADDRESS,
-                  .san.unstructured_name = { .p = (unsigned char *)SAN_IP_WIFI, .len = 4 } },
-        .next = &san_usb };
-    mbedtls_x509_san_list san_dns = {
-        .node = { .type = MBEDTLS_X509_SAN_DNS_NAME,
-                  .san.unstructured_name = { .p = (unsigned char *)"esp32key.local", .len = 14 } },
-        .next = &san_wifi };
+    /* SubjectAltName chain: hostname + both service IPs. Declared up front (and
+     * with field assignments rather than designated initializers, which C++ won't
+     * let nest as .san.unstructured_name) so no goto-to-cleanup jumps over an
+     * initializer. */
+    mbedtls_x509_san_list san_usb = {};
+    san_usb.node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+    san_usb.node.san.unstructured_name.p = (unsigned char *)SAN_IP_USB;
+    san_usb.node.san.unstructured_name.len = 4;
+    san_usb.next = NULL;
+    mbedtls_x509_san_list san_wifi = {};
+    san_wifi.node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+    san_wifi.node.san.unstructured_name.p = (unsigned char *)SAN_IP_WIFI;
+    san_wifi.node.san.unstructured_name.len = 4;
+    san_wifi.next = &san_usb;
+    mbedtls_x509_san_list san_dns = {};
+    san_dns.node.type = MBEDTLS_X509_SAN_DNS_NAME;
+    san_dns.node.san.unstructured_name.p = (unsigned char *)"esp32key.local";
+    san_dns.node.san.unstructured_name.len = 14;
+    san_dns.next = &san_wifi;
+
+    /* Declared before the first goto: C++ forbids a goto from jumping over an
+     * initialized variable that is still in scope at the label (done:). */
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
 
     mbedtls_pk_init(&key);
     mbedtls_x509write_crt_init(&crt);
@@ -86,7 +95,6 @@ static void generate(Store& store, char **cert_pem, size_t *cert_len,
 
     /* Generate an exportable EC P-256 (secp256r1) key pair usable for ECDSA.
      * Exportable is required by mbedtls_pk_copy_from_psa(). */
-    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
     psa_set_key_bits(&attr, 256);
     psa_set_key_usage_flags(&attr,
@@ -139,17 +147,20 @@ static void generate(Store& store, char **cert_pem, size_t *cert_len,
     memcpy(*key_pem, keybuf, *key_len);
     memcpy(*cert_pem, crtbuf, *cert_len);
 
-    uint8_t cver = CERT_SCHEMA_VERSION;
     try {
+        uint8_t cver = CERT_SCHEMA_VERSION;
         store.set_blob(PKEY_KEY, *key_pem, *key_len);
         store.set_blob(CERT_KEY, *cert_pem, *cert_len);
         store.set_blob(CVER_KEY, &cver, sizeof cver);
         store.commit();
         rc = ESP_OK;
     } catch (...) {
+        /* Fall through to the done: cleanup (psa_destroy_key + mbedtls frees) so a
+         * store-write failure doesn't leak the PSA key / x509 contexts; rc stays
+         * non-OK, so the trailing throw fires after cleanup. */
         free(*key_pem);  *key_pem = nullptr;
         free(*cert_pem); *cert_pem = nullptr;
-        throw;
+        rc = ESP_FAIL;
     }
 
 done:
