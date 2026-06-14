@@ -1,3 +1,3 @@
-idf_component_register(SRCS "test_vault_session.c"
+idf_component_register(SRCS "test_vault_session.cpp"
                        INCLUDE_DIRS "."
-                       REQUIRES unity vault_session)
+                       REQUIRES doctest vault_session)
