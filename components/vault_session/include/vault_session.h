@@ -38,7 +38,10 @@ private:
     uint64_t last_seen_ms_ = 0;
     int      fail_count_ = 0;
     uint64_t lockout_until_ms_ = 0;
-    uint32_t idle_ms_ = VS_IDLE_DEFAULT_MS;
+    /* Written on the httpd task (set_idle_ms), read on the LED timer task
+     * (idle_ms/check_idle). Single writer + aligned 32-bit store/load is atomic
+     * on this core, so volatile (no torn reads) is sufficient -- no lock needed. */
+    volatile uint32_t idle_ms_ = VS_IDLE_DEFAULT_MS;
     ExpiryCallback expiry_cb_;
 };
 
