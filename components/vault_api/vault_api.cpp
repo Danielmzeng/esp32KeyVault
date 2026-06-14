@@ -141,7 +141,7 @@ esp_err_t ApiServer::h_state_impl(httpd_req_t *r)
     cJSON_AddBoolToObject(o, "initialized", vault_.is_initialized());
     cJSON_AddBoolToObject(o, "unlocked", authed(r) && vault_.is_unlocked());
     /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
-    cJSON_AddNumberToObject(o, "idle_ms", VS_IDLE_MS);
+    cJSON_AddNumberToObject(o, "idle_ms", session_.idle_ms());
     return send_json(r, 200, o);
 }
 

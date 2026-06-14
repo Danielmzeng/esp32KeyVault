@@ -48,7 +48,7 @@ void Session::create(uint64_t now_ms, char out_token_hex[VS_TOKEN_HEX]) {
 
 bool Session::check_idle(uint64_t now_ms) {
     if (!active_) return false;
-    if (now_ms - last_seen_ms_ > VS_IDLE_MS) {
+    if (now_ms - last_seen_ms_ > idle_ms_) {
         destroy();
         if (expiry_cb_) expiry_cb_();   // e.g. Vault::lock(): wipe DEK on idle
         return true;
@@ -59,8 +59,14 @@ bool Session::check_idle(uint64_t now_ms) {
 uint32_t Session::idle_remaining_ms(uint64_t now_ms) {
     if (!active_) return 0;
     uint64_t elapsed = now_ms - last_seen_ms_;
-    if (elapsed >= VS_IDLE_MS) return 0;
-    return (uint32_t)(VS_IDLE_MS - elapsed);
+    if (elapsed >= idle_ms_) return 0;
+    return (uint32_t)(idle_ms_ - elapsed);
+}
+
+void Session::set_idle_ms(uint32_t ms) {
+    if (ms < VS_IDLE_MIN_MS) ms = VS_IDLE_MIN_MS;
+    if (ms > VS_IDLE_MAX_MS) ms = VS_IDLE_MAX_MS;
+    idle_ms_ = ms;
 }
 
 bool Session::validate(const char* token_hex, uint64_t now_ms) {
