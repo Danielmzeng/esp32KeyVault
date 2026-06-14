@@ -170,7 +170,7 @@ function paint() {
       await api('/api/idle', {method:'POST', body:JSON.stringify({seconds:secs})});
       idleMs = secs * 1000;          // update the client mirror of the auto-lock window
       armIdle();                      // re-arm with the new window
-      msg.style.color = '#080'; msg.textContent = 'Saved.';
+      msg.style.color = '#070'; msg.textContent = 'Saved.';
     } catch (e) { msg.style.color = '#b00'; msg.textContent = e.message; }
   };
   document.querySelectorAll('.rev').forEach(b=>b.onclick=async ev=>{
