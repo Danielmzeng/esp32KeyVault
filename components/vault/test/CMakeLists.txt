@@ -1,3 +1,3 @@
-idf_component_register(SRCS "test_vault.c"
+idf_component_register(SRCS "test_vault.cpp"
                        INCLUDE_DIRS "."
-                       REQUIRES unity vault vault_store)
+                       REQUIRES doctest vault vault_store)
