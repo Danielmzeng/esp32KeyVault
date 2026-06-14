@@ -246,7 +246,10 @@ esp_err_t ApiServer::h_entry_secret_impl(httpd_req_t *r)
         return err_json(r,404,"not found");
     int id = uri_id(r); if (id < 0) return err_json(r,400,"bad id");
     char secret[VAULT_FIELD_MAX], url[VAULT_FIELD_MAX], comment[VAULT_FIELD_MAX];
-    if (!vault_.reveal((uint8_t)id, secret, url, comment)) return err_json(r,404,"not found");
+    bool found;
+    try { found = vault_.reveal((uint8_t)id, secret, url, comment); }
+    catch (const vault::Error&) { return err_json(r,404,"not found"); }   /* locked */
+    if (!found) return err_json(r,404,"not found");
     cJSON *o=cJSON_CreateObject();
     cJSON_AddStringToObject(o,"secret",secret);
     cJSON_AddStringToObject(o,"url",url);
@@ -262,9 +265,12 @@ esp_err_t ApiServer::h_entry_update_impl(httpd_req_t *r)
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
-    bool ok = vault_.update((uint8_t)id, json_str(j,"title"), json_str(j,"username"),
-                            json_str(j,"secret"), json_str(j,"url"), json_str(j,"comment"),
-                            (uint8_t)json_int(j,"category"));
+    bool ok;
+    try {
+        ok = vault_.update((uint8_t)id, json_str(j,"title"), json_str(j,"username"),
+                           json_str(j,"secret"), json_str(j,"url"), json_str(j,"comment"),
+                           (uint8_t)json_int(j,"category"));
+    } catch (const vault::Error&) { cJSON_Delete(j); return err_json(r,404,"not found"); }
     cJSON_Delete(j);
     if (!ok) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
@@ -310,7 +316,10 @@ esp_err_t ApiServer::h_cat_delete_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     int id = uri_cat_id(r); if (id <= 0) return err_json(r,400,"bad id");
-    if (!vault_.category_delete((uint8_t)id)) return err_json(r,404,"not found");
+    bool ok;
+    try { ok = vault_.category_delete((uint8_t)id); }
+    catch (const vault::Error&) { return err_json(r,404,"not found"); }   /* locked */
+    if (!ok) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
@@ -319,7 +328,10 @@ esp_err_t ApiServer::h_entry_delete_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     int id = uri_id(r); if (id < 0) return err_json(r,400,"bad id");
-    if (!vault_.remove((uint8_t)id)) return err_json(r,404,"not found");
+    bool ok;
+    try { ok = vault_.remove((uint8_t)id); }
+    catch (const vault::Error&) { return err_json(r,404,"not found"); }   /* locked */
+    if (!ok) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
@@ -332,7 +344,9 @@ esp_err_t ApiServer::h_change_pw_impl(httpd_req_t *r)
     if (!j) return err_json(r,400,"bad json");
     const char *cur = json_str(j,"current"), *next = json_str(j,"next");
     if (next[0] == '\0') { cJSON_Delete(j); return err_json(r,400,"new password required"); }
-    bool ok = vault_.change_password(cur, strlen(cur), next, strlen(next));
+    bool ok;
+    try { ok = vault_.change_password(cur, strlen(cur), next, strlen(next)); }
+    catch (const vault::Error&) { cJSON_Delete(j); return err_json(r,403,"wrong current password"); }
     cJSON_Delete(j);
     if (!ok) return err_json(r,403,"wrong current password");
     return send_json(r, 200, cJSON_CreateObject());
@@ -383,7 +397,8 @@ esp_err_t ApiServer::h_export_impl(httpd_req_t *r)
     try { n = vault_.list(list, VAULT_MAX_ENTRIES); }
     catch (const vault::Error&) { free(list); return err_json(r,403,"locked"); }
     static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
-    cn = vault_.category_list(cats, VAULT_MAX_CATEGORIES);
+    try { cn = vault_.category_list(cats, VAULT_MAX_CATEGORIES); }
+    catch (const vault::Error&) { free(list); return err_json(r,403,"locked"); }
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o,"format","esp32key-export");
@@ -463,7 +478,8 @@ esp_err_t ApiServer::h_import_impl(httpd_req_t *r)
     try { n = vault_.list(list, VAULT_MAX_ENTRIES); }
     catch (const vault::Error&) { free(list); cJSON_Delete(j); return err_json(r,403,"locked"); }
     static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
-    cn = vault_.category_list(cats, VAULT_MAX_CATEGORIES);
+    try { cn = vault_.category_list(cats, VAULT_MAX_CATEGORIES); }
+    catch (const vault::Error&) { free(list); cJSON_Delete(j); return err_json(r,403,"locked"); }
 
     /* One NVS commit for the whole import, not one per entry: faster, far less
      * flash wear, and all-or-nothing on disk (a crash mid-loop leaves the old
