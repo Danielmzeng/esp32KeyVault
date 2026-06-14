@@ -16,7 +16,7 @@ void WifiAp::load_or_default(const char* key, const char* def, char* buf, size_t
     bool got = false;
     try { got = store_.get_blob(key, buf, len); } catch (...) { got = false; }
     if (!got) { strlcpy(buf, def, buflen); return; }
-    buf[buflen - 1] = '\0';   // defensive: ensure NUL-terminated
+    buf[len < buflen ? len : buflen - 1] = '\0';   // terminate at the bytes read (not the buffer end)
 }
 
 void WifiAp::start(const char* default_ssid, const char* default_password) {

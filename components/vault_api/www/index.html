@@ -217,7 +217,9 @@ function paint() {
 
 async function renderSettings() {
   let ssid = '';
-  try { ssid = (await api('/api/wifi')).ssid || ''; } catch(_){}
+  /* On a 401 the api() helper already calls boot() (renders the unlock screen)
+   * and throws; bail out instead of repainting Settings over the login view. */
+  try { ssid = (await api('/api/wifi')).ssid || ''; } catch(_){ return; }
   $('#app').innerHTML = `<img class=logo src="${LOGO}" alt="esp32key">
     <h2>Settings</h2>
     <h3>WiFi access point</h3>
