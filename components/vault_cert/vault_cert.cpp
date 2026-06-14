@@ -1,13 +1,16 @@
 #include "vault_cert.h"
 #include "vault_store.h"
+#include "vault_error.h"
 
 #include "psa/crypto.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/x509.h"
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
+
+namespace vault {
 
 /*
  * ESP-IDF v6.0.1 ships mbedTLS 4.x (tf-psa-crypto restructure). The classic
@@ -47,13 +50,13 @@
 static const unsigned char SAN_IP_WIFI[4] = {192, 168, 4, 1};
 static const unsigned char SAN_IP_USB[4]  = {10, 10, 0, 1};
 
-static esp_err_t generate(char **cert_pem, size_t *cert_len,
-                          char **key_pem, size_t *key_len)
+static void generate(Store& store, char **cert_pem, size_t *cert_len,
+                     char **key_pem, size_t *key_len)
 {
     mbedtls_pk_context key;
     mbedtls_x509write_cert crt;
     psa_key_id_t key_id = MBEDTLS_SVC_KEY_ID_INIT;
-    esp_err_t result = ESP_FAIL;
+    esp_err_t rc = ESP_FAIL;
     /* P-256 PEM private key ~250B, self-signed cert PEM well under 1K. */
     unsigned char keybuf[1024] = {0};
     unsigned char crtbuf[1024] = {0};
@@ -125,26 +128,28 @@ static esp_err_t generate(char **cert_pem, size_t *cert_len,
 
     *key_len  = strlen((char *)keybuf) + 1;
     *cert_len = strlen((char *)crtbuf) + 1;
-    *key_pem  = malloc(*key_len);
-    *cert_pem = malloc(*cert_len);
+    *key_pem  = (char*)malloc(*key_len);
+    *cert_pem = (char*)malloc(*cert_len);
     if (!*key_pem || !*cert_pem) {
         free(*key_pem);  *key_pem = NULL;
         free(*cert_pem); *cert_pem = NULL;
-        result = ESP_ERR_NO_MEM;
+        rc = ESP_ERR_NO_MEM;
         goto done;
     }
     memcpy(*key_pem, keybuf, *key_len);
     memcpy(*cert_pem, crtbuf, *cert_len);
 
     uint8_t cver = CERT_SCHEMA_VERSION;
-    if (vs_set_blob(PKEY_KEY, *key_pem, *key_len) == ESP_OK &&
-        vs_set_blob(CERT_KEY, *cert_pem, *cert_len) == ESP_OK &&
-        vs_set_blob(CVER_KEY, &cver, sizeof cver) == ESP_OK &&
-        vs_commit() == ESP_OK) {
-        result = ESP_OK;
-    } else {
-        free(*key_pem);  *key_pem = NULL;
-        free(*cert_pem); *cert_pem = NULL;
+    try {
+        store.set_blob(PKEY_KEY, *key_pem, *key_len);
+        store.set_blob(CERT_KEY, *cert_pem, *cert_len);
+        store.set_blob(CVER_KEY, &cver, sizeof cver);
+        store.commit();
+        rc = ESP_OK;
+    } catch (...) {
+        free(*key_pem);  *key_pem = nullptr;
+        free(*cert_pem); *cert_pem = nullptr;
+        throw;
     }
 
 done:
@@ -153,42 +158,44 @@ done:
     }
     mbedtls_x509write_crt_free(&crt);
     mbedtls_pk_free(&key);
-    return result;
+    if (rc != ESP_OK) throw vault::Error(rc, "cert generate");
 }
 
-esp_err_t vault_cert_get(char **cert_pem, size_t *cert_len,
-                         char **key_pem, size_t *key_len)
+void Cert::get(char **cert_pem, size_t *cert_len,
+               char **key_pem, size_t *key_len)
 {
     if (!cert_pem || !cert_len || !key_pem || !key_len) {
-        return ESP_ERR_INVALID_ARG;
+        throw vault::Error(ESP_ERR_INVALID_ARG, "cert get args");
     }
 
     /* Only reuse a cached cert that matches the current schema; otherwise
      * regenerate (e.g. to pick up newly added SANs) without touching the vault. */
     uint8_t cver = 0; size_t cvlen = sizeof cver;
-    bool cver_ok = (vs_get_blob(CVER_KEY, &cver, &cvlen) == ESP_OK &&
-                    cver == CERT_SCHEMA_VERSION);
+    bool cver_ok = store_.get_blob(CVER_KEY, &cver, cvlen) && cver == CERT_SCHEMA_VERSION;
 
     size_t clen = 0, klen = 0;
     if (cver_ok &&
-        vs_get_blob(CERT_KEY, NULL, &clen) == ESP_OK &&
-        vs_get_blob(PKEY_KEY, NULL, &klen) == ESP_OK) {
-        *cert_pem = malloc(clen);
-        *key_pem  = malloc(klen);
+        store_.get_blob(CERT_KEY, nullptr, clen) &&
+        store_.get_blob(PKEY_KEY, nullptr, klen)) {
+        *cert_pem = (char*)malloc(clen);
+        *key_pem  = (char*)malloc(klen);
         if (!*cert_pem || !*key_pem) {
-            free(*cert_pem); *cert_pem = NULL;
-            free(*key_pem);  *key_pem = NULL;
-            return ESP_ERR_NO_MEM;
+            free(*cert_pem); *cert_pem = nullptr;
+            free(*key_pem);  *key_pem = nullptr;
+            throw vault::Error(ESP_ERR_NO_MEM, "cert get");
         }
-        if (vs_get_blob(CERT_KEY, *cert_pem, &clen) == ESP_OK &&
-            vs_get_blob(PKEY_KEY, *key_pem, &klen) == ESP_OK) {
+        if (store_.get_blob(CERT_KEY, *cert_pem, clen) &&
+            store_.get_blob(PKEY_KEY, *key_pem, klen)) {
             *cert_len = clen;
             *key_len  = klen;
-            return ESP_OK;
+            return;
         }
-        free(*cert_pem); *cert_pem = NULL;
-        free(*key_pem);  *key_pem = NULL;
-        return ESP_FAIL;
+        free(*cert_pem); *cert_pem = nullptr;
+        free(*key_pem);  *key_pem = nullptr;
+        throw vault::Error(ESP_FAIL, "cert read");
     }
-    return generate(cert_pem, cert_len, key_pem, key_len);
+    generate(store_, cert_pem, cert_len, key_pem, key_len);
+    return;
 }
+
+}  // namespace vault
