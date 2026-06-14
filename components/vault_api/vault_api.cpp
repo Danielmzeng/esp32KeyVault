@@ -205,11 +205,14 @@ esp_err_t ApiServer::h_wifi_set_impl(httpd_req_t *r)
     strlcpy(pw,   pw_s,   sizeof pw);
     cJSON_Delete(j);
     wifi_.set_credentials(ssid, pw);   // throws on NVS fault -> 500 via trampoline
-    /* Reboot shortly so the AP restarts on the new creds; delay lets the 200 flush. */
+    /* Send the 200 first, THEN arm the reboot, so esp_restart can't clip the
+     * in-flight TLS write; the ~2 s delay gives the response time to reach the
+     * client (which is likely connected through the AP being reconfigured). */
+    esp_err_t sent = send_json(r, 200, cJSON_CreateObject());
     esp_timer_create_args_t ra = {}; ra.callback = reboot_cb; ra.name = "reboot";
     esp_timer_handle_t rt;
-    if (esp_timer_create(&ra, &rt) == ESP_OK) esp_timer_start_once(rt, 1500ULL * 1000);
-    return send_json(r, 200, cJSON_CreateObject());
+    if (esp_timer_create(&ra, &rt) == ESP_OK) esp_timer_start_once(rt, 2000ULL * 1000);
+    return sent;
 }
 
 /* ---- /api/setup ---- */
