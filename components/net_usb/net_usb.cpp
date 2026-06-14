@@ -1,4 +1,5 @@
 #include "net_usb.h"
+#include "vault_error.h"
 #include "esp_netif.h"
 #include "tinyusb.h"
 #include "tinyusb_net.h"
@@ -6,6 +7,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+
+namespace vault {
 
 static esp_netif_t *s_usb_netif;
 
@@ -23,7 +26,7 @@ static esp_err_t netif_transmit(void *h, void *buffer, size_t len)
 
 static void l2_free(void *h, void *buffer) { (void)h; (void)buffer; }
 
-esp_err_t net_usb_start(void)
+void UsbNet::start()
 {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -32,36 +35,34 @@ esp_err_t net_usb_start(void)
     esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_ETH();
     base.if_desc = "usb";
     base.route_prio = 10;
-    base.flags = ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP;
+    base.flags = (esp_netif_flags_t)(ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP);
 
-    esp_netif_ip_info_t ip = {0};
+    esp_netif_ip_info_t ip = {};
     ip.ip.addr      = ESP_IP4TOADDR(10, 10, 0, 1);
     ip.gw.addr      = ESP_IP4TOADDR(10, 10, 0, 1);
     ip.netmask.addr = ESP_IP4TOADDR(255, 255, 255, 0);
     base.ip_info = &ip;
 
-    esp_netif_config_t cfg = {
-        .base   = &base,
-        .driver = NULL,
-        .stack  = ESP_NETIF_NETSTACK_DEFAULT_ETH,
-    };
+    esp_netif_config_t cfg = {};
+    cfg.base   = &base;
+    cfg.driver = nullptr;
+    cfg.stack  = ESP_NETIF_NETSTACK_DEFAULT_ETH;
     s_usb_netif = esp_netif_new(&cfg);
 
-    esp_netif_driver_ifconfig_t drv = {
-        .handle = (void *)1,
-        .transmit = netif_transmit,
-        .driver_free_rx_buffer = l2_free,
-    };
-    ESP_ERROR_CHECK(esp_netif_set_driver_config(s_usb_netif, &drv));
+    esp_netif_driver_ifconfig_t drv = {};
+    drv.handle = (void *)1;
+    drv.transmit = netif_transmit;
+    drv.driver_free_rx_buffer = l2_free;
+    check(esp_netif_set_driver_config(s_usb_netif, &drv), "usb netif driver");
 
-    const tinyusb_config_t tusb_cfg = { .external_phy = false };
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    tinyusb_config_t tusb_cfg = {};
+    tusb_cfg.external_phy = false;
+    check(tinyusb_driver_install(&tusb_cfg), "tinyusb install");
 
-    tinyusb_net_config_t net_cfg = {
-        .on_recv_callback = rx_cb,
-    };
+    tinyusb_net_config_t net_cfg = {};
+    net_cfg.on_recv_callback = rx_cb;
     memcpy(net_cfg.mac_addr, mac, 6);
-    ESP_ERROR_CHECK(tinyusb_net_init(TINYUSB_USBDEV_0, &net_cfg));
+    check(tinyusb_net_init(TINYUSB_USBDEV_0, &net_cfg), "tinyusb net init");
 
     /* Bring the interface up AND mark the link connected. Unlike the Wi-Fi AP,
      * this hand-rolled driver has no event handlers to drive the lifecycle, so
@@ -69,5 +70,6 @@ esp_err_t net_usb_start(void)
      * the DHCP server never starts -> the USB host gets no 10.10.0.x lease. */
     esp_netif_action_start(s_usb_netif, NULL, 0, NULL);
     esp_netif_action_connected(s_usb_netif, NULL, 0, NULL);
-    return ESP_OK;
 }
+
+}  // namespace vault

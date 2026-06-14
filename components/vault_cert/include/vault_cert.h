@@ -1,8 +1,18 @@
 #pragma once
-#include <stddef.h>
-#include "esp_err.h"
+#include <cstddef>
+#include "vault_store.h"
 
-/* Loads a PEM cert+key pair from NVS, generating and persisting a new
- * self-signed pair on first call. Buffers are malloc'd; caller frees. */
-esp_err_t vault_cert_get(char **cert_pem, size_t *cert_len,
-                         char **key_pem,  size_t *key_len);
+namespace vault {
+
+// Loads a PEM cert+key pair from NVS (via Store), generating and persisting a new
+// self-signed pair on first call or when the cached schema is stale. Output buffers
+// are malloc'd; caller frees. Throws vault::Error on failure.
+class Cert {
+public:
+    explicit Cert(Store& store) : store_(store) {}
+    void get(char** cert_pem, size_t* cert_len, char** key_pem, size_t* key_len);
+private:
+    Store& store_;
+};
+
+}  // namespace vault

@@ -1,7 +1,7 @@
 #pragma once
-#include <stdbool.h>
-#include <stdint.h>
-#include <stddef.h>
+#include <cstdint>
+#include <cstddef>
+#include <functional>
 
 #define VS_TOKEN_LEN   32          /* bytes; hex-encoded => 64 chars */
 #define VS_TOKEN_HEX   (VS_TOKEN_LEN * 2 + 1)
@@ -9,32 +9,32 @@
 #define VS_MAX_FAILS   5
 #define VS_LOCKOUT_MS  (60 * 1000)
 
-void  vsess_reset(void);                       /* clear session + fail counter (test aid) */
+namespace vault {
 
-/* Register a callback invoked when a session expires due to idle timeout
- * (e.g. vault_lock to wipe the DEK). Keeps this module independent of the vault.
- * Pass NULL to clear. */
-typedef void (*vsess_expiry_cb_t)(void);
-void  vsess_set_expiry_cb(vsess_expiry_cb_t cb);
+class Session {
+public:
+    using ExpiryCallback = std::function<void()>;
 
-/* Login gating. Returns false if currently locked out. */
-bool  vsess_login_allowed(uint64_t now_ms);
-void  vsess_note_login_result(bool success, uint64_t now_ms);
+    void reset();                                 // clear session + fail counter (test aid)
+    void set_expiry_cb(ExpiryCallback cb);        // fired on idle expiry (e.g. Vault::lock)
 
-/* Create a session token after a successful unlock. out is VS_TOKEN_HEX chars. */
-void  vsess_create(uint64_t now_ms, char out_token_hex[VS_TOKEN_HEX]);
-/* Validate a presented token; refreshes idle timer on success. */
-bool  vsess_validate(const char *token_hex, uint64_t now_ms);
+    bool login_allowed(uint64_t now_ms);          // false if currently locked out
+    void note_login_result(bool success, uint64_t now_ms);
 
-/* If a session is active and has been idle longer than VS_IDLE_MS, destroy it and
- * fire the expiry callback. Returns true if it expired. Lets a periodic timer
- * lock the vault even when no request comes in to drive vsess_validate. Must be
- * called from the same context as vsess_validate (the httpd task) -- it is not
- * internally synchronized. */
-bool  vsess_check_idle(uint64_t now_ms);
+    void create(uint64_t now_ms, char out_token_hex[VS_TOKEN_HEX]);
+    bool validate(const char* token_hex, uint64_t now_ms);  // refreshes idle timer on success
 
-/* Milliseconds until the active session idles out (0 if expired or no session).
- * Lets the status LED show a countdown toward auto-lock. */
-uint32_t vsess_idle_remaining_ms(uint64_t now_ms);
+    bool check_idle(uint64_t now_ms);             // expire + fire cb if idle too long
+    uint32_t idle_remaining_ms(uint64_t now_ms);  // ms until idle-out (0 if none/expired)
+    void destroy();                               // logout
 
-void  vsess_destroy(void);                     /* logout */
+private:
+    char     token_[VS_TOKEN_HEX] = {0};
+    bool     active_ = false;
+    uint64_t last_seen_ms_ = 0;
+    int      fail_count_ = 0;
+    uint64_t lockout_until_ms_ = 0;
+    ExpiryCallback expiry_cb_;
+};
+
+}  // namespace vault

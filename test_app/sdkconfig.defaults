@@ -1,3 +1,6 @@
+# Target must match the main app (net_usb/tinyusb is esp32s3-only).
+CONFIG_IDF_TARGET="esp32s3"
+
 # Required by vault_cert: runtime X.509 self-signed certificate creation.
 # MBEDTLS_X509_CREATE_C defaults to 'n' in ESP-IDF v6; it pulls in
 # MBEDTLS_X509_CRT_WRITE_C (the mbedtls_x509write_crt_* API). PK_WRITE_C and
@@ -10,3 +13,6 @@ CONFIG_TINYUSB_NET_MODE_NCM=y
 # Required by vault_api: TLS server + HTTPS server support.
 CONFIG_ESP_TLS_SERVER=y
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# Enable C++ exceptions for the C++ port (and doctest, which needs them).
+CONFIG_COMPILER_CXX_EXCEPTIONS=y

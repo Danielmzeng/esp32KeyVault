@@ -1,13 +1,16 @@
 #include "vault_crypto.h"
+#include "vault_error.h"
 #include "psa/crypto.h"
 #include "sha/sha_core.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
 
-esp_err_t vc_init(void)
+namespace vault::crypto {
+
+void init()
 {
-    return (psa_crypto_init() == PSA_SUCCESS) ? ESP_OK : ESP_FAIL;
+    if (psa_crypto_init() != PSA_SUCCESS) throw vault::Error(ESP_FAIL, "psa init");
 }
 
 /* HMAC-SHA256 hash block size. */
@@ -24,12 +27,12 @@ esp_err_t vc_init(void)
  * VC_KEY_LEN (32) equals the SHA-256 output, so the derived key is PBKDF2 block 1:
  *   U1 = HMAC(pw, salt || INT32BE(1)); Ui = HMAC(pw, U(i-1)); key = U1 ^ ... ^ Uc.
  * HMAC(pw, m) = SHA256(k_opad || SHA256(k_ipad || m)), pads precomputed once. */
-esp_err_t vc_derive_key(const char *password, size_t password_len,
-                        const uint8_t salt[VC_SALT_LEN], uint32_t iterations,
-                        uint8_t out_key[VC_KEY_LEN])
+void derive_key(const char *password, size_t password_len,
+                const uint8_t salt[VC_SALT_LEN], uint32_t iterations,
+                uint8_t out_key[VC_KEY_LEN])
 {
-    if (!password || !salt || !out_key) return ESP_ERR_INVALID_ARG;
-    _Static_assert(VC_KEY_LEN == 32, "single-block PBKDF2 assumes 32-byte key");
+    if (!password || !salt || !out_key) throw vault::Error(ESP_ERR_INVALID_ARG, "derive_key args");
+    static_assert(VC_KEY_LEN == 32, "single-block PBKDF2 assumes 32-byte key");
 
     /* inner message is salt||idx (VC_SALT_LEN+4) for U1, or a 32-byte U thereafter;
      * size the buffer for whichever is larger. */
@@ -81,12 +84,11 @@ esp_err_t vc_derive_key(const char *password, size_t password_len,
     memset(outer_in, 0, sizeof outer_in);
     memset(u, 0, sizeof u);
     memset(t, 0, sizeof t);
-    return ESP_OK;
 }
 
 #include "esp_random.h"
 
-void vc_random(uint8_t *buf, size_t len) { esp_fill_random(buf, len); }
+void random(uint8_t *buf, size_t len) { esp_fill_random(buf, len); }
 
 /* Helper: import a raw AES-256 key for AEAD and return its key_id.
  * Caller must call psa_destroy_key() when done. */
@@ -102,14 +104,13 @@ static psa_status_t import_aes_key(const uint8_t key[VC_KEY_LEN],
     return psa_import_key(&attrs, key, VC_KEY_LEN, out_id);
 }
 
-esp_err_t vc_gcm_encrypt(const uint8_t key[VC_KEY_LEN],
-                         const uint8_t nonce[VC_NONCE_LEN],
-                         const uint8_t *aad, size_t aad_len,
-                         const uint8_t *pt, size_t pt_len,
-                         uint8_t *ct, uint8_t tag[VC_TAG_LEN])
+void gcm_encrypt(const uint8_t key[VC_KEY_LEN], const uint8_t nonce[VC_NONCE_LEN],
+                 const uint8_t *aad, size_t aad_len,
+                 const uint8_t *pt, size_t pt_len,
+                 uint8_t *ct, uint8_t tag[VC_TAG_LEN])
 {
     psa_key_id_t key_id = 0;
-    if (import_aes_key(key, PSA_KEY_USAGE_ENCRYPT, &key_id) != PSA_SUCCESS) return ESP_FAIL;
+    if (import_aes_key(key, PSA_KEY_USAGE_ENCRYPT, &key_id) != PSA_SUCCESS) throw vault::Error(ESP_FAIL, "gcm key import");
 
     psa_aead_operation_t op = PSA_AEAD_OPERATION_INIT;
     psa_status_t status;
@@ -125,18 +126,16 @@ esp_err_t vc_gcm_encrypt(const uint8_t key[VC_KEY_LEN],
 done:
     if (status != PSA_SUCCESS) psa_aead_abort(&op);
     psa_destroy_key(key_id);
-    return (status == PSA_SUCCESS) ? ESP_OK : ESP_FAIL;
+    if (status != PSA_SUCCESS) throw vault::Error(ESP_FAIL, "gcm encrypt");
 }
 
-esp_err_t vc_gcm_decrypt(const uint8_t key[VC_KEY_LEN],
-                         const uint8_t nonce[VC_NONCE_LEN],
-                         const uint8_t *aad, size_t aad_len,
-                         const uint8_t *ct, size_t ct_len,
-                         const uint8_t tag[VC_TAG_LEN],
-                         uint8_t *pt)
+bool gcm_decrypt(const uint8_t key[VC_KEY_LEN], const uint8_t nonce[VC_NONCE_LEN],
+                 const uint8_t *aad, size_t aad_len,
+                 const uint8_t *ct, size_t ct_len,
+                 const uint8_t tag[VC_TAG_LEN], uint8_t *pt)
 {
     psa_key_id_t key_id = 0;
-    if (import_aes_key(key, PSA_KEY_USAGE_DECRYPT, &key_id) != PSA_SUCCESS) return ESP_FAIL;
+    if (import_aes_key(key, PSA_KEY_USAGE_DECRYPT, &key_id) != PSA_SUCCESS) return false;
 
     psa_aead_operation_t op = PSA_AEAD_OPERATION_INIT;
     psa_status_t status;
@@ -152,75 +151,72 @@ esp_err_t vc_gcm_decrypt(const uint8_t key[VC_KEY_LEN],
 done:
     if (status != PSA_SUCCESS) psa_aead_abort(&op);
     psa_destroy_key(key_id);
-    return (status == PSA_SUCCESS) ? ESP_OK : ESP_FAIL;
+    return status == PSA_SUCCESS;
 }
 
-esp_err_t vc_dek_create(const uint8_t kek[VC_KEY_LEN],
-                        uint8_t out_dek[VC_KEY_LEN],
-                        uint8_t out_wrapped[VC_WRAPPED_DEK_LEN])
+void dek_create(const uint8_t kek[VC_KEY_LEN], uint8_t out_dek[VC_KEY_LEN],
+                uint8_t out_wrapped[VC_WRAPPED_DEK_LEN])
 {
-    vc_random(out_dek, VC_KEY_LEN);
+    random(out_dek, VC_KEY_LEN);
     uint8_t *nonce = out_wrapped;
     uint8_t *ct    = out_wrapped + VC_NONCE_LEN;
     uint8_t *tag   = out_wrapped + VC_NONCE_LEN + VC_KEY_LEN;
-    vc_random(nonce, VC_NONCE_LEN);
-    return vc_gcm_encrypt(kek, nonce, NULL, 0, out_dek, VC_KEY_LEN, ct, tag);
+    random(nonce, VC_NONCE_LEN);
+    gcm_encrypt(kek, nonce, NULL, 0, out_dek, VC_KEY_LEN, ct, tag);
 }
 
-esp_err_t vc_dek_unwrap(const uint8_t kek[VC_KEY_LEN],
-                        const uint8_t wrapped[VC_WRAPPED_DEK_LEN],
-                        uint8_t out_dek[VC_KEY_LEN])
+bool dek_unwrap(const uint8_t kek[VC_KEY_LEN],
+                const uint8_t wrapped[VC_WRAPPED_DEK_LEN], uint8_t out_dek[VC_KEY_LEN])
 {
     const uint8_t *nonce = wrapped;
     const uint8_t *ct    = wrapped + VC_NONCE_LEN;
     const uint8_t *tag   = wrapped + VC_NONCE_LEN + VC_KEY_LEN;
-    return vc_gcm_decrypt(kek, nonce, NULL, 0, ct, VC_KEY_LEN, tag, out_dek);
+    return gcm_decrypt(kek, nonce, nullptr, 0, ct, VC_KEY_LEN, tag, out_dek);
 }
 
 #define BUNDLE_ITERATIONS 100000u
 static const char BUNDLE_MAGIC[4] = {'E','K','V','1'};
 
-esp_err_t vc_bundle_pack(const char *password, size_t pw_len,
-                         const uint8_t *plain, size_t plain_len,
-                         uint8_t *out, size_t *out_len)
+void bundle_pack(const char *password, size_t pw_len,
+                 const uint8_t *plain, size_t plain_len,
+                 uint8_t *out, size_t *out_len)
 {
-    if (*out_len < VC_BUNDLE_HDR + plain_len) return ESP_ERR_INVALID_SIZE;
+    if (*out_len < VC_BUNDLE_HDR + plain_len) throw vault::Error(ESP_ERR_INVALID_SIZE, "bundle too small");
     uint8_t *p = out;
     memcpy(p, BUNDLE_MAGIC, 4); p += 4;
     *p++ = VC_BUNDLE_VERSION;
-    uint8_t *salt = p; vc_random(salt, VC_SALT_LEN); p += VC_SALT_LEN;
+    uint8_t *salt = p; random(salt, VC_SALT_LEN); p += VC_SALT_LEN;
     uint32_t iter = BUNDLE_ITERATIONS; memcpy(p, &iter, 4); p += 4;
-    uint8_t *nonce = p; vc_random(nonce, VC_NONCE_LEN); p += VC_NONCE_LEN;
+    uint8_t *nonce = p; random(nonce, VC_NONCE_LEN); p += VC_NONCE_LEN;
     uint8_t *tag = p; p += VC_TAG_LEN;
     uint8_t *ct = p;
 
     uint8_t key[VC_KEY_LEN];
-    if (vc_derive_key(password, pw_len, salt, iter, key) != ESP_OK) return ESP_FAIL;
-    esp_err_t e = vc_gcm_encrypt(key, nonce, NULL, 0, plain, plain_len, ct, tag);
-    if (e != ESP_OK) return e;
+    derive_key(password, pw_len, salt, iter, key);
+    gcm_encrypt(key, nonce, NULL, 0, plain, plain_len, ct, tag);
     *out_len = VC_BUNDLE_HDR + plain_len;
-    return ESP_OK;
 }
 
-esp_err_t vc_bundle_unpack(const char *password, size_t pw_len,
+BundleResult bundle_unpack(const char *password, size_t pw_len,
                            const uint8_t *bundle, size_t bundle_len,
                            uint8_t *out_plain, size_t *out_len)
 {
-    if (bundle_len < VC_BUNDLE_HDR) return ESP_ERR_INVALID_SIZE;
-    if (memcmp(bundle, BUNDLE_MAGIC, 4) != 0) return ESP_ERR_INVALID_ARG;
-    if (bundle[4] != VC_BUNDLE_VERSION) return ESP_ERR_INVALID_VERSION;
+    if (bundle_len < VC_BUNDLE_HDR) return BundleResult::TooSmall;
+    if (memcmp(bundle, BUNDLE_MAGIC, 4) != 0) return BundleResult::BadMagic;
+    if (bundle[4] != VC_BUNDLE_VERSION) return BundleResult::BadVersion;
     const uint8_t *salt  = bundle + 5;
     uint32_t iter; memcpy(&iter, bundle + 5 + VC_SALT_LEN, 4);
     const uint8_t *nonce = bundle + 5 + VC_SALT_LEN + 4;
     const uint8_t *tag   = nonce + VC_NONCE_LEN;
     const uint8_t *ct    = tag + VC_TAG_LEN;
     size_t ct_len = bundle_len - VC_BUNDLE_HDR;
-    if (*out_len < ct_len) return ESP_ERR_INVALID_SIZE;
+    if (*out_len < ct_len) return BundleResult::TooSmall;
 
     uint8_t key[VC_KEY_LEN];
-    if (vc_derive_key(password, pw_len, salt, iter, key) != ESP_OK) return ESP_FAIL;
-    esp_err_t e = vc_gcm_decrypt(key, nonce, NULL, 0, ct, ct_len, tag, out_plain);
-    if (e != ESP_OK) return e;       /* wrong password / tamper */
+    derive_key(password, pw_len, salt, iter, key);
+    if (!gcm_decrypt(key, nonce, NULL, 0, ct, ct_len, tag, out_plain)) return BundleResult::WrongPassword;  /* wrong password / tamper */
     *out_len = ct_len;
-    return ESP_OK;
+    return BundleResult::Ok;
 }
+
+}  // namespace vault::crypto

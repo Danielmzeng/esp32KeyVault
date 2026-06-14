@@ -47,6 +47,34 @@ in ESP-IDF v6). The TLS server uses a self-signed EC P-256 certificate generated
 on first boot and stored on the device — your browser will show a one-time
 "not secure" warning that you can accept (or trust the cert to silence it).
 
+## Hardware-backed security (roadmap)
+
+The ESP32-S3 crypto accelerator is already used for the heavy lifting: PBKDF2
+runs on the hardware SHA engine, AES-256-GCM block operations run on the hardware
+AES engine, and all keys/nonces come from the hardware TRNG. (The S3 has no
+hardware GHASH block, so the GCM authentication tag is finished in software —
+that is the chip's ceiling, not a configuration gap.)
+
+What the accelerator does **not** yet do is protect keys *at rest*. Today the
+wrapped DEK and all entry ciphertext sit in plaintext flash/NVS, so an attacker
+who dumps the flash can brute-force the master password offline. The S3's
+hardware security peripherals can close that gap — planned hardening steps:
+
+- **Flash encryption** — burn an AES key into eFuse so the whole flash (firmware
+  *and* NVS, including the wrapped DEK and entry ciphertext) is transparently
+  encrypted at rest; a chip-off / flash dump then yields only ciphertext.
+  Enabling it burns eFuses and is irreversible on a given board — develop in
+  "Development" mode first.
+- **eFuse-bound key via the Digital Signature (DS) / HMAC peripheral** — wrap or
+  derive the KEK with a key held in eFuse that software cannot read, binding the
+  vault to the physical chip. It then can't be unlocked or brute-forced from a
+  flash image alone, or moved to another board.
+- **Secure Boot v2** — require signed firmware, so a stolen device can't be
+  reflashed with an image that exfiltrates secrets.
+
+These layer on top of the existing app-level AES-256-GCM without changing the
+on-disk vault format. None are enabled in this build.
+
 ## Hardware
 
 - An ESP32-S3 dev board with PSRAM and at least 4 MB flash.
@@ -148,8 +176,9 @@ At the Unity menu, run each suite: `[vault_crypto]`, `[vault_store]`,
 
 ## Known limitations
 
-- App-level encryption only; ESP32 hardware flash-encryption / secure boot is
-  not enabled (a possible future hardening step).
+- App-level encryption only; the ESP32-S3 hardware security peripherals (flash
+  encryption, eFuse-bound key, Secure Boot) are not enabled — see
+  [Hardware-backed security](#hardware-backed-security-roadmap) for the roadmap.
 - Decrypted secrets may linger in scratch RAM after lock until overwritten.
 - Export files are plaintext (for portability) — anyone with the file can read
   every secret. Handle and delete them accordingly.

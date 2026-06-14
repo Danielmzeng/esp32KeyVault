@@ -1,8 +1,9 @@
 #pragma once
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include <cstddef>
+#include <cstdint>
 #include "esp_err.h"
+#include "vault_store.h"
+#include "vault_crypto.h"   // VC_KEY_LEN etc. for member buffers
 
 #define VAULT_MAX_ENTRIES     64
 #define VAULT_FIELD_MAX       128
@@ -14,9 +15,9 @@ typedef struct {
     uint8_t  category_id;               /* 0 = Uncategorized */
     char     title[VAULT_FIELD_MAX];
     char     username[VAULT_FIELD_MAX];
-    char     url[VAULT_FIELD_MAX];      /* only populated after vault_reveal */
-    char     secret[VAULT_FIELD_MAX];   /* only populated after vault_reveal */
-    char     comment[VAULT_FIELD_MAX];  /* only populated after vault_reveal */
+    char     url[VAULT_FIELD_MAX];      /* only populated after reveal */
+    char     secret[VAULT_FIELD_MAX];   /* only populated after reveal */
+    char     comment[VAULT_FIELD_MAX];  /* only populated after reveal */
 } vault_entry_t;
 
 typedef struct {
@@ -24,66 +25,79 @@ typedef struct {
     char     name[VAULT_CAT_NAME_MAX];
 } vault_category_t;
 
-/* Call once at boot after vs_init: if a vault exists but predates the current
- * on-disk format, factory-reset it so the device comes up clean. */
-esp_err_t vault_init(void);
+namespace vault {
 
-bool      vault_is_initialized(void);   /* has setup ever run? */
-bool      vault_is_unlocked(void);
-bool      vault_is_busy(void);          /* a slow PBKDF2 derivation (unlock) is in progress */
+class Vault {
+public:
+    explicit Vault(Store& store) : store_(store) {}
+    ~Vault();   // frees PSRAM buffers
 
-esp_err_t vault_setup(const char *master, size_t master_len);   /* first run */
-esp_err_t vault_unlock(const char *master, size_t master_len);  /* ESP_ERR_INVALID_STATE if not init; ESP_FAIL if wrong pw */
-void      vault_lock(void);                                     /* wipes DEK from RAM */
-esp_err_t vault_change_password(const char *cur, size_t cur_len,
-                                const char *next, size_t next_len);
+    void init();              // boot-time format check / auto-reset
+    bool is_initialized();
+    bool is_unlocked() const { return unlocked_; }
+    bool is_busy() const { return deriving_; }
 
-/* CRUD — require unlocked vault, else ESP_ERR_INVALID_STATE.
- * vault_list fills id/category_id/title/username; url/secret/comment are left
- * empty (the hidden fields are only returned by vault_reveal). */
-esp_err_t vault_list(vault_entry_t *out, size_t cap, size_t *count);
-esp_err_t vault_reveal(uint8_t id, char secret_out[VAULT_FIELD_MAX],
-                       char url_out[VAULT_FIELD_MAX],
-                       char comment_out[VAULT_FIELD_MAX]);
-esp_err_t vault_add(const char *title, const char *username, const char *secret,
-                    const char *url, const char *comment, uint8_t category_id,
-                    uint8_t *out_id);
-esp_err_t vault_update(uint8_t id, const char *title, const char *username,
-                       const char *secret, const char *url, const char *comment,
-                       uint8_t category_id);
-esp_err_t vault_delete(uint8_t id);
-/* Delete every entry at once. Keeps categories and the master/transfer
- * passwords — this empties the vault, it does not factory-reset it. */
-esp_err_t vault_clear_entries(void);
+    void setup(const char* master, size_t master_len);   // throws InvalidState if already init
+    bool unlock(const char* master, size_t master_len);  // false on wrong pw; throws InvalidState if not init
+    void lock();
+    bool change_password(const char* cur, size_t cur_len,
+                         const char* next, size_t next_len);  // false on wrong current pw
 
-/* Categories — require unlocked vault. The built-in "Uncategorized" (id 0) is
- * implicit and not returned by vault_category_list. */
-esp_err_t vault_category_list(vault_category_t *out, size_t cap, size_t *count);
-esp_err_t vault_category_add(const char *name, uint8_t *out_id);
-esp_err_t vault_category_delete(uint8_t id);   /* reassigns its entries to id 0 */
+    // CRUD — throw vault::Error(ESP_ERR_INVALID_STATE) if locked.
+    size_t list(vault_entry_t* out, size_t cap);           // returns count
+    bool   reveal(uint8_t id, char secret_out[VAULT_FIELD_MAX],
+                  char url_out[VAULT_FIELD_MAX],
+                  char comment_out[VAULT_FIELD_MAX]);        // false if id not found
+    uint8_t add(const char* title, const char* username, const char* secret,
+                const char* url, const char* comment, uint8_t category_id); // returns new id; throws on full
+    bool   update(uint8_t id, const char* title, const char* username,
+                  const char* secret, const char* url, const char* comment,
+                  uint8_t category_id);                      // false if id not found
+    bool   remove(uint8_t id);                               // false if id not found
+    void   clear_entries();
 
-/* Transfer password — set during first-run setup, gates/encrypts export. */
-esp_err_t vault_set_transfer_password(const char *pw, size_t len);
-bool      vault_verify_transfer(const char *pw, size_t len);
+    // Categories — throw InvalidState if locked.
+    size_t  category_list(vault_category_t* out, size_t cap);
+    uint8_t category_add(const char* name);   // returns id; throws Error(ESP_ERR_INVALID_STATE) on duplicate
+    bool    category_delete(uint8_t id);       // false if not found; throws InvalidArg if id==0
 
-/* Export all entries as a portable bundle encrypted under the transfer
- * password. Requires unlocked vault + correct transfer password.
- * *out_bundle is malloc'd; caller frees. */
-esp_err_t vault_export(const char *transfer_pw, size_t len,
-                       uint8_t **out_bundle, size_t *out_len);
+    void set_transfer_password(const char* pw, size_t len);
+    bool verify_transfer(const char* pw, size_t len);
 
-/* Bulk-edit window for import: while open, vault_add/vault_update mutate the
- * in-RAM table but defer the NVS commit; vault_bulk_commit() persists once (and
- * closes the window). Always pair begin with commit, even on the error path, or
- * later writes stay deferred. */
-void      vault_bulk_begin(void);
-esp_err_t vault_bulk_commit(void);
+    // Binary bundle export/import (used by tests). out_bundle is malloc'd; caller frees.
+    bool export_bundle(const char* transfer_pw, size_t len, uint8_t** out_bundle, size_t* out_len); // false on wrong pw
+    void bulk_begin();
+    void bulk_commit();                        // throws InvalidState if locked
+    bool import_bundle(const char* transfer_pw, size_t len,
+                       const uint8_t* bundle, size_t bundle_len);  // false on wrong pw / bad format
 
-/* Import a bundle (decrypted with the supplied transfer password) and merge:
- * an imported entry replaces a local one with the same title+username; others
- * are added. Requires unlocked vault. Returns ESP_FAIL on wrong password. */
-esp_err_t vault_import(const char *transfer_pw, size_t len,
-                       const uint8_t *bundle, size_t bundle_len);
+    void factory_reset();
 
-/* Erase all vault state from NVS and lock. Returns to uninitialized state. */
-void vault_factory_reset(void);
+private:
+    // ---- helpers (were file-local statics) ----
+    bool   ensure_buffers();   // allocate PSRAM buffers; returns false on OOM
+    size_t serialize_entries(uint8_t* plain);
+    void   persist_entries();  // throws on store/crypto fault
+    void   load_entries();
+    void   persist_cats();
+    void   load_cats();
+    void   load_kek(const char* master, size_t mlen, uint8_t kek[VC_KEY_LEN]); // throws InvalidState if no salt
+    vault_entry_t* find(uint8_t id);
+    uint8_t alloc_id();
+    uint8_t alloc_cat_id();
+    bool    category_valid(uint8_t id);
+
+    Store& store_;
+    bool   unlocked_ = false;
+    uint8_t dek_[VC_KEY_LEN] = {0};
+    vault_entry_t*   entries_   = nullptr;   // VAULT_MAX_ENTRIES (PSRAM)
+    uint8_t*         io_plain_  = nullptr;   // PLAIN_MAX (PSRAM)
+    uint8_t*         io_blob_   = nullptr;   // BLOB_MAX (PSRAM)
+    size_t           count_     = 0;
+    bool             bulk_      = false;
+    volatile bool    deriving_  = false;
+    vault_category_t cats_[VAULT_MAX_CATEGORIES] = {};
+    size_t           cat_count_ = 0;
+};
+
+}  // namespace vault

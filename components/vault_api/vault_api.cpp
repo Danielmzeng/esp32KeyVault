@@ -2,6 +2,7 @@
 #include "vault.h"
 #include "vault_session.h"
 #include "status_led.h"
+#include "vault_error.h"
 #include "esp_https_server.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -10,12 +11,22 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
+#include <exception>
+
+using vault::ApiServer;
 
 static const char *TAG = "vault_api";
-static httpd_handle_t s_srv;   /* for the idle-lock timer to queue work onto */
+
+/* The uri_match_fn C callback has no context slot, and there is only ever one
+ * server, so a pair of file-local pointers route the activity pulse. Both are
+ * set at the top of start(). (Documented no-context workaround.) */
+static ApiServer *s_instance = nullptr;
+static vault::StatusLed *s_led = nullptr;
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
+
+namespace {
 
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
 
@@ -50,7 +61,7 @@ static esp_err_t err_json(httpd_req_t *r, int status, const char *msg)
 static char *read_body_cap(httpd_req_t *r, size_t maxlen)
 {
     if (r->content_len == 0 || r->content_len > maxlen) return NULL;
-    char *buf = malloc(r->content_len + 1);
+    char *buf = (char*)malloc(r->content_len + 1);
     if (!buf) return NULL;
     size_t got = 0;
     while (got < r->content_len) {
@@ -63,17 +74,6 @@ static char *read_body_cap(httpd_req_t *r, size_t maxlen)
 }
 static char *read_body(httpd_req_t *r) { return read_body_cap(r, 2048); }
 
-/* Extract and validate our session cookie. httpd_req_get_cookie_val parses the
- * named cookie with framework-maintained RFC handling and reads only the "sid"
- * value, so it isn't defeated by other cookies or whole-header truncation. */
-static bool authed(httpd_req_t *r)
-{
-    char tok[VS_TOKEN_HEX];
-    size_t len = sizeof tok;
-    if (httpd_req_get_cookie_val(r, "sid", tok, &len) != ESP_OK) return false;
-    return vsess_validate(tok, now_ms());
-}
-
 /* ---- static files ---- */
 static esp_err_t h_static(httpd_req_t *r, const uint8_t *start, const uint8_t *end, const char *type)
 {
@@ -81,17 +81,6 @@ static esp_err_t h_static(httpd_req_t *r, const uint8_t *start, const uint8_t *e
     return httpd_resp_send(r, (const char *)start, end - start);
 }
 static esp_err_t h_index(httpd_req_t *r){ return h_static(r,index_html_start,index_html_end,"text/html"); }
-
-/* ---- /api/state ---- */
-static esp_err_t h_state(httpd_req_t *r)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject(o, "initialized", vault_is_initialized());
-    cJSON_AddBoolToObject(o, "unlocked", authed(r) && vault_is_unlocked());
-    /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
-    cJSON_AddNumberToObject(o, "idle_ms", VS_IDLE_MS);
-    return send_json(r, 200, o);
-}
 
 static const char *json_str(cJSON *root, const char *k)
 {
@@ -105,8 +94,59 @@ static int json_int(cJSON *root, const char *k)
     return cJSON_IsNumber(i) ? i->valueint : 0;
 }
 
+/* Parse trailing numeric id from URI, optionally with a suffix like "/secret". */
+static int uri_id(httpd_req_t *r)
+{
+    const char *p = strstr(r->uri, "/api/entries/");
+    if (!p) return -1;
+    return atoi(p + strlen("/api/entries/"));
+}
+
+/* Parse trailing numeric id from a "/api/categories/{id}" URI. */
+static int uri_cat_id(httpd_req_t *r)
+{
+    const char *p = strstr(r->uri, "/api/categories/");
+    if (!p) return -1;
+    return atoi(p + strlen("/api/categories/"));
+}
+
+/* URI matcher wrapper: the one chokepoint every request routes through. Pulse
+ * the activity LED whenever a request matches an /api/ route, so the indicator
+ * lives in a single place instead of every handler. Runs on the httpd task and
+ * only sets a flag, so it adds nothing to the handler hot path. */
+static bool uri_match_activity(const char *tpl, const char *uri, size_t upto)
+{
+    bool m = httpd_uri_match_wildcard(tpl, uri, upto);
+    if (m && strncmp(tpl, "/api/", 5) == 0 && s_led) s_led->activity();
+    return m;
+}
+
+}  // anonymous namespace
+
+/* Extract and validate our session cookie. httpd_req_get_cookie_val parses the
+ * named cookie with framework-maintained RFC handling and reads only the "sid"
+ * value, so it isn't defeated by other cookies or whole-header truncation. */
+bool ApiServer::authed(httpd_req_t *r)
+{
+    char tok[VS_TOKEN_HEX];
+    size_t len = sizeof tok;
+    if (httpd_req_get_cookie_val(r, "sid", tok, &len) != ESP_OK) return false;
+    return session_.validate(tok, now_ms());
+}
+
+/* ---- /api/state ---- */
+esp_err_t ApiServer::h_state_impl(httpd_req_t *r)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "initialized", vault_.is_initialized());
+    cJSON_AddBoolToObject(o, "unlocked", authed(r) && vault_.is_unlocked());
+    /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
+    cJSON_AddNumberToObject(o, "idle_ms", VS_IDLE_MS);
+    return send_json(r, 200, o);
+}
+
 /* ---- /api/setup ---- */
-static esp_err_t h_setup(httpd_req_t *r)
+esp_err_t ApiServer::h_setup_impl(httpd_req_t *r)
 {
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
@@ -114,24 +154,24 @@ static esp_err_t h_setup(httpd_req_t *r)
     const char *pw = json_str(j,"password");
     const char *tpw = json_str(j,"transfer_password");
     if (strlen(pw) == 0 || strlen(tpw) == 0) { cJSON_Delete(j); return err_json(r,400,"both passwords required"); }
-    esp_err_t e = vault_setup(pw, strlen(pw));
-    if (e != ESP_OK) { cJSON_Delete(j); return err_json(r,400,"already initialized"); }
+    try { vault_.setup(pw, strlen(pw)); }
+    catch (const vault::Error&) { cJSON_Delete(j); return err_json(r,400,"already initialized"); }
     /* Two back-to-back PBKDF2 derivations on this task; yield so the idle task
      * runs and the task watchdog is satisfied between them. */
     vTaskDelay(pdMS_TO_TICKS(20));
-    e = vault_set_transfer_password(tpw, strlen(tpw));
-    if (e != ESP_OK) { vault_factory_reset(); cJSON_Delete(j); return err_json(r,500,"setup failed, try again"); }
+    try { vault_.set_transfer_password(tpw, strlen(tpw)); }
+    catch (...) { vault_.factory_reset(); cJSON_Delete(j); return err_json(r,500,"setup failed, try again"); }
     cJSON_Delete(j);
-    char tok[VS_TOKEN_HEX]; vsess_create(now_ms(), tok);
+    char tok[VS_TOKEN_HEX]; session_.create(now_ms(), tok);
     char hdr[128]; snprintf(hdr,sizeof hdr,"sid=%s; HttpOnly; Secure; Path=/; SameSite=Strict", tok);
     httpd_resp_set_hdr(r, "Set-Cookie", hdr);
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- /api/login ---- */
-static esp_err_t h_login(httpd_req_t *r)
+esp_err_t ApiServer::h_login_impl(httpd_req_t *r)
 {
-    if (!vsess_login_allowed(now_ms())) return err_json(r,403,"locked out, try later");
+    if (!session_.login_allowed(now_ms())) return err_json(r,403,"locked out, try later");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
@@ -139,30 +179,33 @@ static esp_err_t h_login(httpd_req_t *r)
     /* Reject empty password before counting it: otherwise empty-body POSTs
      * would burn the lockout budget and DoS the legitimate user. */
     if (strlen(pw) == 0) { cJSON_Delete(j); return err_json(r,400,"password required"); }
-    esp_err_t e = vault_unlock(pw, strlen(pw));
+    bool ok;
+    try { ok = vault_.unlock(pw, strlen(pw)); }
+    catch (const vault::Error&) { ok = false; }
     cJSON_Delete(j);
-    vsess_note_login_result(e == ESP_OK, now_ms());
-    if (e != ESP_OK) return err_json(r,401,"invalid password");
-    char tok[VS_TOKEN_HEX]; vsess_create(now_ms(), tok);
+    session_.note_login_result(ok, now_ms());
+    if (!ok) return err_json(r,401,"invalid password");
+    char tok[VS_TOKEN_HEX]; session_.create(now_ms(), tok);
     char hdr[128]; snprintf(hdr,sizeof hdr,"sid=%s; HttpOnly; Secure; Path=/; SameSite=Strict", tok);
     httpd_resp_set_hdr(r, "Set-Cookie", hdr);
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- /api/logout ---- */
-static esp_err_t h_logout(httpd_req_t *r)
+esp_err_t ApiServer::h_logout_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
-    vsess_destroy(); vault_lock();
+    session_.destroy(); vault_.lock();
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- GET /api/entries ---- */
-static esp_err_t h_entries_list(httpd_req_t *r)
+esp_err_t ApiServer::h_entries_list_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     static vault_entry_t list[VAULT_MAX_ENTRIES]; size_t n = 0;
-    if (vault_list(list, VAULT_MAX_ENTRIES, &n) != ESP_OK) return err_json(r,403,"locked");
+    try { n = vault_.list(list, VAULT_MAX_ENTRIES); }
+    catch (const vault::Error&) { return err_json(r,403,"locked"); }
     cJSON *o = cJSON_CreateObject(); cJSON *arr = cJSON_AddArrayToObject(o,"entries");
     for (size_t i=0;i<n;i++){ cJSON *e=cJSON_CreateObject();
         cJSON_AddNumberToObject(e,"id",list[i].id);
@@ -174,32 +217,24 @@ static esp_err_t h_entries_list(httpd_req_t *r)
 }
 
 /* ---- POST /api/entries ---- */
-static esp_err_t h_entries_add(httpd_req_t *r)
+esp_err_t ApiServer::h_entries_add_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     uint8_t id;
-    esp_err_t e = vault_add(json_str(j,"title"), json_str(j,"username"), json_str(j,"secret"),
-                            json_str(j,"url"), json_str(j,"comment"),
-                            (uint8_t)json_int(j,"category"), &id);
+    try { id = vault_.add(json_str(j,"title"), json_str(j,"username"), json_str(j,"secret"),
+                          json_str(j,"url"), json_str(j,"comment"),
+                          (uint8_t)json_int(j,"category")); }
+    catch (const vault::Error&) { cJSON_Delete(j); return err_json(r,400,"add failed"); }
     cJSON_Delete(j);
-    if (e != ESP_OK) return err_json(r,400,"add failed");
     cJSON *o=cJSON_CreateObject(); cJSON_AddNumberToObject(o,"id",id);
     return send_json(r, 200, o);
 }
 
-/* Parse trailing numeric id from URI, optionally with a suffix like "/secret". */
-static int uri_id(httpd_req_t *r)
-{
-    const char *p = strstr(r->uri, "/api/entries/");
-    if (!p) return -1;
-    return atoi(p + strlen("/api/entries/"));
-}
-
 /* ---- GET /api/entries/{id}/secret ---- */
-static esp_err_t h_entry_secret(httpd_req_t *r)
+esp_err_t ApiServer::h_entry_secret_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     /* Trailing-wildcard route (matcher only honors a final asterisk), so require
@@ -211,7 +246,10 @@ static esp_err_t h_entry_secret(httpd_req_t *r)
         return err_json(r,404,"not found");
     int id = uri_id(r); if (id < 0) return err_json(r,400,"bad id");
     char secret[VAULT_FIELD_MAX], url[VAULT_FIELD_MAX], comment[VAULT_FIELD_MAX];
-    if (vault_reveal((uint8_t)id, secret, url, comment) != ESP_OK) return err_json(r,404,"not found");
+    bool found;
+    try { found = vault_.reveal((uint8_t)id, secret, url, comment); }
+    catch (const vault::Error&) { return err_json(r,404,"not found"); }   /* locked */
+    if (!found) return err_json(r,404,"not found");
     cJSON *o=cJSON_CreateObject();
     cJSON_AddStringToObject(o,"secret",secret);
     cJSON_AddStringToObject(o,"url",url);
@@ -220,27 +258,31 @@ static esp_err_t h_entry_secret(httpd_req_t *r)
 }
 
 /* ---- PUT /api/entries/{id} ---- */
-static esp_err_t h_entry_update(httpd_req_t *r)
+esp_err_t ApiServer::h_entry_update_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     int id = uri_id(r); if (id < 0) return err_json(r,400,"bad id");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
-    esp_err_t e = vault_update((uint8_t)id, json_str(j,"title"), json_str(j,"username"),
-                               json_str(j,"secret"), json_str(j,"url"), json_str(j,"comment"),
-                               (uint8_t)json_int(j,"category"));
+    bool ok;
+    try {
+        ok = vault_.update((uint8_t)id, json_str(j,"title"), json_str(j,"username"),
+                           json_str(j,"secret"), json_str(j,"url"), json_str(j,"comment"),
+                           (uint8_t)json_int(j,"category"));
+    } catch (const vault::Error&) { cJSON_Delete(j); return err_json(r,404,"not found"); }
     cJSON_Delete(j);
-    if (e != ESP_OK) return err_json(r,404,"not found");
+    if (!ok) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- GET /api/categories ---- */
-static esp_err_t h_cats_list(httpd_req_t *r)
+esp_err_t ApiServer::h_cats_list_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t n = 0;
-    if (vault_category_list(cats, VAULT_MAX_CATEGORIES, &n) != ESP_OK) return err_json(r,403,"locked");
+    try { n = vault_.category_list(cats, VAULT_MAX_CATEGORIES); }
+    catch (const vault::Error&) { return err_json(r,403,"locked"); }
     cJSON *o = cJSON_CreateObject(); cJSON *arr = cJSON_AddArrayToObject(o,"categories");
     for (size_t i=0;i<n;i++){ cJSON *c=cJSON_CreateObject();
         cJSON_AddNumberToObject(c,"id",cats[i].id);
@@ -250,7 +292,7 @@ static esp_err_t h_cats_list(httpd_req_t *r)
 }
 
 /* ---- POST /api/categories ---- body {name} */
-static esp_err_t h_cats_add(httpd_req_t *r)
+esp_err_t ApiServer::h_cats_add_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
@@ -258,42 +300,43 @@ static esp_err_t h_cats_add(httpd_req_t *r)
     if (!j) return err_json(r,400,"bad json");
     const char *name = json_str(j,"name");
     uint8_t id;
-    esp_err_t e = vault_category_add(name, &id);
+    try { id = vault_.category_add(name); }
+    catch (const vault::Error& e) {
+        cJSON_Delete(j);
+        if (e.code() == ESP_ERR_INVALID_STATE) return err_json(r,409,"category exists");
+        return err_json(r,400,"add failed");
+    }
     cJSON_Delete(j);
-    if (e == ESP_ERR_INVALID_STATE) return err_json(r,409,"category exists");
-    if (e != ESP_OK) return err_json(r,400,"add failed");
     cJSON *o=cJSON_CreateObject(); cJSON_AddNumberToObject(o,"id",id);
     return send_json(r, 200, o);
 }
 
-/* Parse trailing numeric id from a "/api/categories/{id}" URI. */
-static int uri_cat_id(httpd_req_t *r)
-{
-    const char *p = strstr(r->uri, "/api/categories/");
-    if (!p) return -1;
-    return atoi(p + strlen("/api/categories/"));
-}
-
 /* ---- DELETE /api/categories/{id} ---- */
-static esp_err_t h_cat_delete(httpd_req_t *r)
+esp_err_t ApiServer::h_cat_delete_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     int id = uri_cat_id(r); if (id <= 0) return err_json(r,400,"bad id");
-    if (vault_category_delete((uint8_t)id) != ESP_OK) return err_json(r,404,"not found");
+    bool ok;
+    try { ok = vault_.category_delete((uint8_t)id); }
+    catch (const vault::Error&) { return err_json(r,404,"not found"); }   /* locked */
+    if (!ok) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- DELETE /api/entries/{id} ---- */
-static esp_err_t h_entry_delete(httpd_req_t *r)
+esp_err_t ApiServer::h_entry_delete_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     int id = uri_id(r); if (id < 0) return err_json(r,400,"bad id");
-    if (vault_delete((uint8_t)id) != ESP_OK) return err_json(r,404,"not found");
+    bool ok;
+    try { ok = vault_.remove((uint8_t)id); }
+    catch (const vault::Error&) { return err_json(r,404,"not found"); }   /* locked */
+    if (!ok) return err_json(r,404,"not found");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- POST /api/change-password ---- */
-static esp_err_t h_change_pw(httpd_req_t *r)
+esp_err_t ApiServer::h_change_pw_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
@@ -301,16 +344,18 @@ static esp_err_t h_change_pw(httpd_req_t *r)
     if (!j) return err_json(r,400,"bad json");
     const char *cur = json_str(j,"current"), *next = json_str(j,"next");
     if (next[0] == '\0') { cJSON_Delete(j); return err_json(r,400,"new password required"); }
-    esp_err_t e = vault_change_password(cur, strlen(cur), next, strlen(next));
+    bool ok;
+    try { ok = vault_.change_password(cur, strlen(cur), next, strlen(next)); }
+    catch (const vault::Error&) { cJSON_Delete(j); return err_json(r,403,"wrong current password"); }
     cJSON_Delete(j);
-    if (e != ESP_OK) return err_json(r,403,"wrong current password");
+    if (!ok) return err_json(r,403,"wrong current password");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
 /* ---- POST /api/change-transfer ---- body {current, next}; rotate the transfer
  * password. Mirrors change-password: requires the unlocked session plus the
  * correct current transfer password. */
-static esp_err_t h_change_transfer(httpd_req_t *r)
+esp_err_t ApiServer::h_change_transfer_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
@@ -318,12 +363,15 @@ static esp_err_t h_change_transfer(httpd_req_t *r)
     if (!j) return err_json(r,400,"bad json");
     const char *cur = json_str(j,"current"), *next = json_str(j,"next");
     if (next[0] == '\0') { cJSON_Delete(j); return err_json(r,400,"new password required"); }
-    esp_err_t e = ESP_FAIL;
-    bool ok = vault_verify_transfer(cur, strlen(cur));
-    if (ok) e = vault_set_transfer_password(next, strlen(next));
+    bool changed = false;
+    bool ok = vault_.verify_transfer(cur, strlen(cur));
+    if (ok) {
+        try { vault_.set_transfer_password(next, strlen(next)); changed = true; }
+        catch (...) { changed = false; }
+    }
     cJSON_Delete(j);
     if (!ok) return err_json(r,403,"wrong transfer password");
-    if (e != ESP_OK) return err_json(r,400,"change failed");
+    if (!changed) return err_json(r,400,"change failed");
     return send_json(r, 200, cJSON_CreateObject());
 }
 
@@ -332,23 +380,25 @@ static esp_err_t h_change_transfer(httpd_req_t *r)
  * password is still required as an intent gate, but the file is NOT encrypted:
  * all secrets are in clear text. Category is emitted by name so it survives a
  * round-trip into a vault with different category ids. */
-static esp_err_t h_export(httpd_req_t *r)
+esp_err_t ApiServer::h_export_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     const char *tpw = json_str(j,"transfer_password");
-    bool ok = vault_verify_transfer(tpw, strlen(tpw));
+    bool ok = vault_.verify_transfer(tpw, strlen(tpw));
     cJSON_Delete(j);
     if (!ok) return err_json(r,403,"wrong transfer password");
 
-    vault_entry_t *list = malloc(VAULT_MAX_ENTRIES * sizeof *list);
+    vault_entry_t *list = (vault_entry_t*)malloc(VAULT_MAX_ENTRIES * sizeof *list);
     if (!list) return err_json(r,500,"oom");
     size_t n = 0;
-    if (vault_list(list, VAULT_MAX_ENTRIES, &n) != ESP_OK) { free(list); return err_json(r,403,"locked"); }
+    try { n = vault_.list(list, VAULT_MAX_ENTRIES); }
+    catch (const vault::Error&) { free(list); return err_json(r,403,"locked"); }
     static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
-    vault_category_list(cats, VAULT_MAX_CATEGORIES, &cn);
+    try { cn = vault_.category_list(cats, VAULT_MAX_CATEGORIES); }
+    catch (const vault::Error&) { free(list); return err_json(r,403,"locked"); }
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o,"format","esp32key-export");
@@ -356,7 +406,7 @@ static esp_err_t h_export(httpd_req_t *r)
     cJSON *arr = cJSON_AddArrayToObject(o,"entries");
     for (size_t i = 0; i < n; i++) {
         char secret[VAULT_FIELD_MAX], url[VAULT_FIELD_MAX], comment[VAULT_FIELD_MAX];
-        if (vault_reveal(list[i].id, secret, url, comment) != ESP_OK) { secret[0]=url[0]=comment[0]='\0'; }
+        if (!vault_.reveal(list[i].id, secret, url, comment)) { secret[0]=url[0]=comment[0]='\0'; }
         const char *cname = "";
         for (size_t k = 0; k < cn; k++) if (cats[k].id == list[i].category_id) { cname = cats[k].name; break; }
         cJSON *e = cJSON_CreateObject();
@@ -387,17 +437,18 @@ static esp_err_t h_export(httpd_req_t *r)
  * Gated by the transfer password (same intent gate as export), not just the
  * session cookie, since it is irreversible. Categories and the master/transfer
  * passwords are preserved — the vault stays set up and unlocked. */
-static esp_err_t h_reset(httpd_req_t *r)
+esp_err_t ApiServer::h_reset_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     const char *tpw = json_str(j,"transfer_password");
-    bool ok = vault_verify_transfer(tpw, strlen(tpw));
+    bool ok = vault_.verify_transfer(tpw, strlen(tpw));
     cJSON_Delete(j);
     if (!ok) return err_json(r,403,"wrong transfer password");
-    if (vault_clear_entries() != ESP_OK) return err_json(r,500,"reset failed");
+    try { vault_.clear_entries(); }
+    catch (...) { return err_json(r,500,"reset failed"); }
     cJSON *o = cJSON_CreateObject(); cJSON_AddBoolToObject(o,"ok",true);
     return send_json(r,200,o);
 }
@@ -408,7 +459,7 @@ static esp_err_t h_reset(httpd_req_t *r)
  * others are added. Category is matched by name; unknown -> Uncategorized.
  * No transfer password: the file is already plaintext and the session cookie
  * already grants full write access. */
-static esp_err_t h_import(httpd_req_t *r)
+esp_err_t ApiServer::h_import_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     /* Must exceed the largest file h_export can produce, or the device can't
@@ -421,17 +472,19 @@ static esp_err_t h_import(httpd_req_t *r)
     cJSON *arr = cJSON_GetObjectItem(j,"entries");
     if (!cJSON_IsArray(arr)) { cJSON_Delete(j); return err_json(r,400,"no entries in file"); }
 
-    vault_entry_t *list = malloc(VAULT_MAX_ENTRIES * sizeof *list);
+    vault_entry_t *list = (vault_entry_t*)malloc(VAULT_MAX_ENTRIES * sizeof *list);
     if (!list) { cJSON_Delete(j); return err_json(r,500,"oom"); }
     size_t n = 0;
-    if (vault_list(list, VAULT_MAX_ENTRIES, &n) != ESP_OK) { free(list); cJSON_Delete(j); return err_json(r,403,"locked"); }
+    try { n = vault_.list(list, VAULT_MAX_ENTRIES); }
+    catch (const vault::Error&) { free(list); cJSON_Delete(j); return err_json(r,403,"locked"); }
     static vault_category_t cats[VAULT_MAX_CATEGORIES]; size_t cn = 0;
-    vault_category_list(cats, VAULT_MAX_CATEGORIES, &cn);
+    try { cn = vault_.category_list(cats, VAULT_MAX_CATEGORIES); }
+    catch (const vault::Error&) { free(list); cJSON_Delete(j); return err_json(r,403,"locked"); }
 
     /* One NVS commit for the whole import, not one per entry: faster, far less
      * flash wear, and all-or-nothing on disk (a crash mid-loop leaves the old
      * vault, not a half-merged one). */
-    vault_bulk_begin();
+    vault_.bulk_begin();
     int imported = 0;
     cJSON *e;
     cJSON_ArrayForEach(e, arr) {
@@ -454,24 +507,26 @@ static esp_err_t h_import(httpd_req_t *r)
             if (strncmp(list[i].title, title, VAULT_FIELD_MAX) == 0 &&
                 strncmp(list[i].username, user, VAULT_FIELD_MAX) == 0) { match_id = list[i].id; break; }
 
-        esp_err_t re;
         if (match_id >= 0) {
-            re = vault_update((uint8_t)match_id, title, user, sec, url, cmt, cat);
+            if (vault_.update((uint8_t)match_id, title, user, sec, url, cmt, cat)) imported++;
         } else {
-            uint8_t nid;
-            re = vault_add(title, user, sec, url, cmt, cat, &nid);
-            if (re == ESP_OK && n < VAULT_MAX_ENTRIES) {
-                list[n].id = nid;
-                strlcpy(list[n].title, title, VAULT_FIELD_MAX);
-                strlcpy(list[n].username, user, VAULT_FIELD_MAX);
-                n++;
+            try {
+                uint8_t nid = vault_.add(title, user, sec, url, cmt, cat);
+                if (n < VAULT_MAX_ENTRIES) {
+                    list[n].id = nid;
+                    strlcpy(list[n].title, title, VAULT_FIELD_MAX);
+                    strlcpy(list[n].username, user, VAULT_FIELD_MAX);
+                    n++;
+                }
+                imported++;
+            } catch (const vault::Error&) {
+                /* capacity reached: stop adding, continue */
             }
         }
-        if (re == ESP_OK) imported++;
     }
-    esp_err_t pe = vault_bulk_commit();
+    try { vault_.bulk_commit(); }
+    catch (...) { free(list); cJSON_Delete(j); return err_json(r,500,"import save failed"); }
     free(list); cJSON_Delete(j);
-    if (pe != ESP_OK) return err_json(r,500,"import save failed");
     cJSON *o = cJSON_CreateObject(); cJSON_AddNumberToObject(o,"imported",imported);
     return send_json(r, 200, o);
 }
@@ -480,28 +535,59 @@ static esp_err_t h_import(httpd_req_t *r)
  * vault/session state is otherwise only ever touched from the httpd task and is
  * not synchronized -- so the timer hands the check to the httpd task via
  * httpd_queue_work, keeping it serialized with request handlers. */
-static void idle_lock_work(void *arg) { (void)arg; vsess_check_idle(now_ms()); }
-
-static void idle_timer_cb(void *arg)
+void ApiServer::idle_lock_work(void *arg)
 {
-    (void)arg;
-    if (s_srv) httpd_queue_work(s_srv, idle_lock_work, NULL);
+    auto *self = static_cast<ApiServer*>(arg);
+    try { self->session_.check_idle(now_ms()); } catch (...) {}
 }
 
-/* URI matcher wrapper: the one chokepoint every request routes through. Pulse
- * the activity LED whenever a request matches an /api/ route, so the indicator
- * lives in a single place instead of every handler. Runs on the httpd task and
- * only sets a flag, so it adds nothing to the handler hot path. */
-static bool uri_match_activity(const char *tpl, const char *uri, size_t upto)
+void ApiServer::idle_timer_cb(void *arg)
 {
-    bool m = httpd_uri_match_wildcard(tpl, uri, upto);
-    if (m && strncmp(tpl, "/api/", 5) == 0) status_led_activity();
-    return m;
+    auto *self = static_cast<ApiServer*>(arg);
+    if (self->srv_) httpd_queue_work(self->srv_, idle_lock_work, self);
 }
 
-esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
-                          const char *key_pem, size_t key_len)
+/* Each request handler gets a static trampoline that recovers `this` from
+ * r->user_ctx, calls the matching _impl member, and maps any exception to a
+ * 500 JSON error so a throw can never escape into the httpd C stack. */
+#define API_HANDLER(NAME)                                                       \
+    esp_err_t ApiServer::NAME(httpd_req_t* r) {                                  \
+        auto* self = static_cast<ApiServer*>(r->user_ctx);                       \
+        try { return self->NAME##_impl(r); }                                     \
+        catch (const vault::Error& e) { return err_json(r, 500, e.what()); }     \
+        catch (const std::exception& e) { return err_json(r, 500, e.what()); }   \
+        catch (...) { return err_json(r, 500, "internal error"); }               \
+    }
+
+/* The trampolines are static members of ApiServer (declared in the header), so
+ * they reach the private *_impl members directly -- no friend needed -- and a
+ * static member converts to the plain function pointer httpd expects. */
+namespace vault {
+API_HANDLER(h_state)
+API_HANDLER(h_setup)
+API_HANDLER(h_login)
+API_HANDLER(h_logout)
+API_HANDLER(h_entries_list)
+API_HANDLER(h_entries_add)
+API_HANDLER(h_entry_secret)
+API_HANDLER(h_entry_update)
+API_HANDLER(h_entry_delete)
+API_HANDLER(h_cats_list)
+API_HANDLER(h_cats_add)
+API_HANDLER(h_cat_delete)
+API_HANDLER(h_change_pw)
+API_HANDLER(h_change_transfer)
+API_HANDLER(h_export)
+API_HANDLER(h_reset)
+API_HANDLER(h_import)
+}  // namespace vault
+
+void ApiServer::start(const char *cert_pem, size_t cert_len,
+                      const char *key_pem, size_t key_len)
 {
+    s_instance = this;
+    s_led = &led_;
+
     /* Clients rejecting our self-signed cert (and OS captive-portal probes)
      * abort the TLS handshake; that is expected, so don't spam it as errors. */
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_NONE);
@@ -519,43 +605,43 @@ esp_err_t vault_api_start(const char *cert_pem, size_t cert_len,
      * USB+Wi-Fi+system tasks that are all pinned to CPU0. */
     cfg.httpd.core_id = 1;
 
-    httpd_handle_t srv = NULL;
-    esp_err_t e = httpd_ssl_start(&srv, &cfg);
-    if (e != ESP_OK) { ESP_LOGE(TAG, "https start failed: %s", esp_err_to_name(e)); return e; }
+    esp_err_t e = httpd_ssl_start(&srv_, &cfg);
+    if (e != ESP_OK) { ESP_LOGE(TAG, "https start failed: %s", esp_err_to_name(e)); throw vault::Error(e, "https start"); }
 
     const httpd_uri_t routes[] = {
-        {"/",                       HTTP_GET,    h_index,         NULL},
-        {"/api/state",              HTTP_GET,    h_state,         NULL},
-        {"/api/setup",              HTTP_POST,   h_setup,         NULL},
-        {"/api/login",              HTTP_POST,   h_login,         NULL},
-        {"/api/logout",             HTTP_POST,   h_logout,        NULL},
-        {"/api/change-password",    HTTP_POST,   h_change_pw,     NULL},
-        {"/api/change-transfer",    HTTP_POST,   h_change_transfer, NULL},
-        {"/api/export",             HTTP_POST,   h_export,        NULL},
-        {"/api/import",             HTTP_POST,   h_import,        NULL},
-        {"/api/reset",              HTTP_POST,   h_reset,         NULL},
-        {"/api/entries",            HTTP_GET,    h_entries_list,  NULL},
-        {"/api/entries",            HTTP_POST,   h_entries_add,   NULL},
-        {"/api/entries/*",          HTTP_GET,    h_entry_secret,  NULL},
-        {"/api/entries/*",          HTTP_PUT,    h_entry_update,  NULL},
-        {"/api/entries/*",          HTTP_DELETE, h_entry_delete,  NULL},
-        {"/api/categories",         HTTP_GET,    h_cats_list,     NULL},
-        {"/api/categories",         HTTP_POST,   h_cats_add,      NULL},
-        {"/api/categories/*",       HTTP_DELETE, h_cat_delete,    NULL},
+        {"/",                       HTTP_GET,    h_index,           this},
+        {"/api/state",              HTTP_GET,    h_state,           this},
+        {"/api/setup",              HTTP_POST,   h_setup,           this},
+        {"/api/login",              HTTP_POST,   h_login,           this},
+        {"/api/logout",             HTTP_POST,   h_logout,          this},
+        {"/api/change-password",    HTTP_POST,   h_change_pw,       this},
+        {"/api/change-transfer",    HTTP_POST,   h_change_transfer, this},
+        {"/api/export",             HTTP_POST,   h_export,          this},
+        {"/api/import",             HTTP_POST,   h_import,          this},
+        {"/api/reset",              HTTP_POST,   h_reset,           this},
+        {"/api/entries",            HTTP_GET,    h_entries_list,    this},
+        {"/api/entries",            HTTP_POST,   h_entries_add,     this},
+        {"/api/entries/*",          HTTP_GET,    h_entry_secret,    this},
+        {"/api/entries/*",          HTTP_PUT,    h_entry_update,    this},
+        {"/api/entries/*",          HTTP_DELETE, h_entry_delete,    this},
+        {"/api/categories",         HTTP_GET,    h_cats_list,       this},
+        {"/api/categories",         HTTP_POST,   h_cats_add,        this},
+        {"/api/categories/*",       HTTP_DELETE, h_cat_delete,      this},
     };
-    for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++)
-        httpd_register_uri_handler(srv, &routes[i]);
+    for (auto& route : routes)
+        httpd_register_uri_handler(srv_, &route);
 
     /* Auto-lock after VS_IDLE_MS (3 min). Poll every 5 s so the lock (and the
      * LED's switch to red) lands promptly after the green fade bottoms out; the
      * lock itself runs on the httpd task (see idle_timer_cb) so it can't race a
      * live handler. */
-    s_srv = srv;
-    const esp_timer_create_args_t idle_args = { .callback = idle_timer_cb, .name = "idle_lock" };
+    esp_timer_create_args_t idle_args = {};
+    idle_args.callback = idle_timer_cb;
+    idle_args.arg = this;
+    idle_args.name = "idle_lock";
     esp_timer_handle_t idle_t;
     if (esp_timer_create(&idle_args, &idle_t) == ESP_OK)
         esp_timer_start_periodic(idle_t, 5ULL * 1000 * 1000);
     else
         ESP_LOGW(TAG, "idle-lock timer failed; vault still locks lazily on next request");
-    return ESP_OK;
 }
