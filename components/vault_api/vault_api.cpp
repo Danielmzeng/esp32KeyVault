@@ -5,6 +5,7 @@
 #include "vault_error.h"
 #include "esp_https_server.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
@@ -31,6 +32,10 @@ namespace {
 /* NVS key for the persisted idle auto-lock window (<=15 chars). Single source
  * for both the write (h_idle_set_impl) and the boot-load read (start()). */
 static const char IDLE_MS_KEY[] = "idle_ms";
+
+/* One-shot esp_timer callback: reboot so a saved AP-credential change takes
+ * effect. Armed ~1.5 s out so the HTTP 200 flushes before the restart. */
+static void reboot_cb(void*) { esp_restart(); }
 
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
 
@@ -170,6 +175,40 @@ esp_err_t ApiServer::h_idle_set_impl(httpd_req_t *r)
     store_.set_blob(IDLE_MS_KEY, &ms, sizeof ms);
     store_.commit();
     session_.set_idle_ms(ms);
+    return send_json(r, 200, cJSON_CreateObject());
+}
+
+/* ---- GET /api/wifi ---- current AP SSID (authed). Password is never returned. */
+esp_err_t ApiServer::h_wifi_get_impl(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r, 401, "locked");
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "ssid", wifi_.ssid());
+    return send_json(r, 200, o);
+}
+
+/* ---- POST /api/wifi ---- set AP SSID+password (authed), persist, then reboot. */
+esp_err_t ApiServer::h_wifi_set_impl(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r, 401, "locked");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    const char *ssid_s = json_str(j, "ssid");
+    const char *pw_s   = json_str(j, "password");
+    size_t sl = strlen(ssid_s), pl = strlen(pw_s);
+    if (sl < 1 || sl > 32) { cJSON_Delete(j); return err_json(r,400,"ssid must be 1-32 chars"); }
+    if (pl < 8 || pl > 63) { cJSON_Delete(j); return err_json(r,400,"password must be 8-63 chars"); }
+    /* Copy out before freeing j; lengths are validated so these can't truncate. */
+    char ssid[33], pw[64];
+    strlcpy(ssid, ssid_s, sizeof ssid);
+    strlcpy(pw,   pw_s,   sizeof pw);
+    cJSON_Delete(j);
+    wifi_.set_credentials(ssid, pw);   // throws on NVS fault -> 500 via trampoline
+    /* Reboot shortly so the AP restarts on the new creds; delay lets the 200 flush. */
+    esp_timer_create_args_t ra = {}; ra.callback = reboot_cb; ra.name = "reboot";
+    esp_timer_handle_t rt;
+    if (esp_timer_create(&ra, &rt) == ESP_OK) esp_timer_start_once(rt, 1500ULL * 1000);
     return send_json(r, 200, cJSON_CreateObject());
 }
 
@@ -593,6 +632,8 @@ void ApiServer::idle_timer_cb(void *arg)
 namespace vault {
 API_HANDLER(h_state)
 API_HANDLER(h_idle_set)
+API_HANDLER(h_wifi_get)
+API_HANDLER(h_wifi_set)
 API_HANDLER(h_setup)
 API_HANDLER(h_login)
 API_HANDLER(h_logout)
@@ -628,7 +669,7 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     cfg.servercert_len = cert_len;
     cfg.prvtkey_pem = (const uint8_t *)key_pem;
     cfg.prvtkey_len = key_len;
-    cfg.httpd.max_uri_handlers = 20;
+    cfg.httpd.max_uri_handlers = 24;
     cfg.httpd.uri_match_fn = uri_match_activity;
     /* Pin the server (TLS handshake + all API handlers) to CPU1, away from the
      * USB+Wi-Fi+system tasks that are all pinned to CPU0. */
@@ -641,6 +682,8 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
         {"/",                       HTTP_GET,    h_index,           this},
         {"/api/state",              HTTP_GET,    h_state,           this},
         {"/api/idle",               HTTP_POST,   h_idle_set,        this},
+        {"/api/wifi",               HTTP_GET,    h_wifi_get,        this},
+        {"/api/wifi",               HTTP_POST,   h_wifi_set,        this},
         {"/api/setup",              HTTP_POST,   h_setup,           this},
         {"/api/login",              HTTP_POST,   h_login,           this},
         {"/api/logout",             HTTP_POST,   h_logout,          this},
