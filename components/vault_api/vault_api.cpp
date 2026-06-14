@@ -156,9 +156,13 @@ esp_err_t ApiServer::h_idle_set_impl(httpd_req_t *r)
     cJSON_Delete(j);
     if (secs < 30 || secs > 3600) return err_json(r,400,"timeout out of range (30-3600s)");
     uint32_t ms = (uint32_t)secs * 1000u;
-    session_.set_idle_ms(ms);
-    store_.set_blob("idle_ms", &ms, sizeof ms);   // throws on fault -> 500 via trampoline
+    /* Persist first: if the NVS write throws (-> 500 via trampoline) the live
+     * window is left unchanged, so the RAM value never diverges from what the
+     * client was told failed. secs is pre-validated in range, so set_idle_ms
+     * stores it as-is. */
+    store_.set_blob("idle_ms", &ms, sizeof ms);
     store_.commit();
+    session_.set_idle_ms(ms);
     return send_json(r, 200, cJSON_CreateObject());
 }
 
