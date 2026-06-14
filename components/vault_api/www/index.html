@@ -119,14 +119,7 @@ function paint() {
       <div class=err id=ce></div>
       <div class=row style="margin-top:.6rem"><button id=xfer>Transfer Entries</button>
         <button id=lock>Lock</button></div>
-      <div class=row style="margin-top:.4rem"><button id=clear>Clear Entries</button>
-        <button id=reset>Reset Device</button></div>
-      <div style="margin-top:.6rem">
-        <label for=idlesec style="display:block;font-size:.8rem;font-weight:600;color:#555">Auto-lock after (seconds)</label>
-        <input id=idlesec type=number min=30 max=3600 step=10>
-        <button id=idlesave>Save timeout</button>
-        <div class=warn id=idlemsg></div>
-      </div>
+      <div class=row style="margin-top:.4rem"><button id=settings>Settings</button></div>
     </div>
     <div class=main>
       <h2>${sel==='all'?'All entries':esc(catName(sel))}</h2>
@@ -158,20 +151,6 @@ function paint() {
     if (!name) return;
     try { await api('/api/categories',{method:'POST',body:JSON.stringify({name})}); renderVault(); }
     catch(e){ $('#ce').textContent = e.message; }
-  };
-  $('#idlesec').value = Math.round(idleMs / 1000);
-  $('#idlesave').onclick = async () => {
-    const secs = Number($('#idlesec').value);
-    const msg = $('#idlemsg');
-    if (!Number.isInteger(secs) || secs < 30 || secs > 3600) {
-      msg.style.color = '#b00'; msg.textContent = 'Enter 30–3600 seconds.'; return;
-    }
-    try {
-      await api('/api/idle', {method:'POST', body:JSON.stringify({seconds:secs})});
-      idleMs = secs * 1000;          // update the client mirror of the auto-lock window
-      armIdle();                      // re-arm with the new window
-      msg.style.color = '#070'; msg.textContent = 'Saved.';
-    } catch (e) { msg.style.color = '#b00'; msg.textContent = e.message; }
   };
   document.querySelectorAll('.rev').forEach(b=>b.onclick=async ev=>{
     const btn=ev.target, d=btn.closest('.entry'), sec=d.querySelector('.sec');
@@ -228,11 +207,62 @@ function paint() {
     catch(e){ $('#e').textContent = e.message; }
   };
   $('#xfer').onclick = renderTransfer;
-  $('#clear').onclick = renderClear;
-  $('#reset').onclick = renderReset;
+  $('#settings').onclick = renderSettings;
   const lock = async()=>{ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); };
   $('#lock').onclick = lock;
   $('#logolock').onclick = lock;   /* clicking the sidebar logo also locks */
+}
+
+async function renderSettings() {
+  let ssid = '';
+  try { ssid = (await api('/api/wifi')).ssid || ''; } catch(_){}
+  $('#app').innerHTML = `<img class=logo src="${LOGO}" alt="esp32key">
+    <h2>Settings</h2>
+    <h3>WiFi access point</h3>
+    <p class=warn>Saving new WiFi settings restarts the device. You'll need to reconnect to the new network and unlock again.</p>
+    <input id=apssid placeholder="AP name (SSID)" maxlength=32 value="${esc(ssid)}">
+    <input id=appw type=password placeholder="New AP password (8-63 chars)" autocomplete="off">
+    <button id=apsave>Save WiFi &amp; restart</button>
+    <div class=warn id=apmsg></div>
+    <h3>Auto-lock</h3>
+    <label for=idlesec style="display:block;font-size:.8rem;font-weight:600;color:#555">Auto-lock after (seconds)</label>
+    <input id=idlesec type=number min=30 max=3600 step=10>
+    <button id=idlesave>Save timeout</button>
+    <div class=warn id=idlemsg></div>
+    <h3>Maintenance</h3>
+    <div class=row><button id=goclear>Clear Entries</button>
+      <button id=goreset>Reset Device</button></div>
+    <div class=row style="margin-top:.6rem"><button id=back>Back</button></div>`;
+  $('#back').onclick = renderVault;
+  $('#goclear').onclick = renderClear;
+  $('#goreset').onclick = renderReset;
+
+  $('#apsave').onclick = async () => {
+    const s = $('#apssid').value.trim(), p = $('#appw').value;
+    const msg = $('#apmsg');
+    if (s.length < 1 || s.length > 32) { msg.style.color='#b00'; msg.textContent='SSID must be 1–32 characters.'; return; }
+    if (p.length < 8 || p.length > 63) { msg.style.color='#b00'; msg.textContent='Password must be 8–63 characters.'; return; }
+    try {
+      await api('/api/wifi', {method:'POST', body:JSON.stringify({ssid:s, password:p})});
+      stopIdle();                       // device is rebooting; don't let the idle timer fire
+      msg.style.color='#070';
+      msg.textContent = `Saved — device is restarting. Reconnect to "${s}" and unlock again.`;
+    } catch(e){ msg.style.color='#b00'; msg.textContent = e.message; }
+  };
+
+  $('#idlesec').value = Math.round(idleMs / 1000);
+  $('#idlesave').onclick = async () => {
+    const secs = Number($('#idlesec').value);
+    const msg = $('#idlemsg');
+    if (!Number.isInteger(secs) || secs < 30 || secs > 3600) {
+      msg.style.color = '#b00'; msg.textContent = 'Enter 30–3600 seconds.'; return;
+    }
+    try {
+      await api('/api/idle', {method:'POST', body:JSON.stringify({seconds:secs})});
+      idleMs = secs * 1000; armIdle();
+      msg.style.color = '#070'; msg.textContent = 'Saved.';
+    } catch (e) { msg.style.color = '#b00'; msg.textContent = e.message; }
+  };
 }
 
 function renderClear() {
@@ -243,7 +273,7 @@ function renderClear() {
     <button id=go>Delete all entries</button>
     <div class=row><button id=back>Back</button></div>
     <div class=err id=e></div>`;
-  $('#back').onclick = renderVault;
+  $('#back').onclick = renderSettings;
   $('#go').onclick = async () => {
     if (!confirm('Delete ALL entries? This cannot be undone.')) return;
     try { await api('/api/reset',{method:'POST',body:JSON.stringify({transfer_password:$('#rpw').value})});
@@ -266,7 +296,7 @@ function renderReset() {
     <button id=got>Change transfer password</button>
     <div class=err id=te></div>
     <div class=row style="margin-top:.6rem"><button id=back>Back</button></div>`;
-  $('#back').onclick = renderVault;
+  $('#back').onclick = renderSettings;
   const rotate = async (path, curEl, newEl, msgEl) => {
     try {
       await api(path,{method:'POST',body:JSON.stringify({current:$(curEl).value, next:$(newEl).value})});
