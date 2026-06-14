@@ -29,8 +29,12 @@ void WifiAp::start(const char* default_ssid, const char* default_password) {
     load_or_default(PW_KEY,   default_password, pw,    sizeof pw);
 
     wifi_config_t ap = {};
-    strlcpy((char*)ap.ap.ssid, ssid_, sizeof ap.ap.ssid);
-    ap.ap.ssid_len = strlen(ssid_);
+    /* The SSID field is 32 bytes and carries its length separately in ssid_len
+     * (no NUL needed), so copy up to 32 bytes -- strlcpy would drop the 32nd
+     * char of a max-length SSID reserving room for a NUL. */
+    size_t slen = strnlen(ssid_, sizeof ap.ap.ssid);
+    memcpy(ap.ap.ssid, ssid_, slen);
+    ap.ap.ssid_len = slen;
     ap.ap.channel = 1;
     ap.ap.max_connection = 2;
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
