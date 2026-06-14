@@ -121,6 +121,12 @@ function paint() {
         <button id=lock>Lock</button></div>
       <div class=row style="margin-top:.4rem"><button id=clear>Clear Entries</button>
         <button id=reset>Reset</button></div>
+      <div style="margin-top:.6rem">
+        <label for=idlesec style="display:block;font-size:.8rem;font-weight:600;color:#555">Auto-lock after (seconds)</label>
+        <input id=idlesec type=number min=30 max=3600 step=10>
+        <button id=idlesave>Save timeout</button>
+        <div class=warn id=idlemsg></div>
+      </div>
     </div>
     <div class=main>
       <h2>${sel==='all'?'All entries':esc(catName(sel))}</h2>
@@ -152,6 +158,20 @@ function paint() {
     if (!name) return;
     try { await api('/api/categories',{method:'POST',body:JSON.stringify({name})}); renderVault(); }
     catch(e){ $('#ce').textContent = e.message; }
+  };
+  $('#idlesec').value = Math.round(idleMs / 1000);
+  $('#idlesave').onclick = async () => {
+    const secs = Number($('#idlesec').value);
+    const msg = $('#idlemsg');
+    if (!Number.isInteger(secs) || secs < 30 || secs > 3600) {
+      msg.style.color = '#b00'; msg.textContent = 'Enter 30–3600 seconds.'; return;
+    }
+    try {
+      await api('/api/idle', {method:'POST', body:JSON.stringify({seconds:secs})});
+      idleMs = secs * 1000;          // update the client mirror of the auto-lock window
+      armIdle();                      // re-arm with the new window
+      msg.style.color = '#080'; msg.textContent = 'Saved.';
+    } catch (e) { msg.style.color = '#b00'; msg.textContent = e.message; }
   };
   document.querySelectorAll('.rev').forEach(b=>b.onclick=async ev=>{
     const btn=ev.target, d=btn.closest('.entry'), sec=d.querySelector('.sec');
