@@ -13,11 +13,29 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # USB OTG + TinyUSB networking (NCM)
 CONFIG_TINYUSB_NET_MODE_NCM=y
 
+# Pin the TinyUSB device task to CPU0 (defaults to CPU1 on the dual-core S3).
+CONFIG_TINYUSB_TASK_AFFINITY_CPU0=y
+
 # HTTPS server enabled (TLS-server side is gated by MBEDTLS_TLS_SERVER, on by default in v6)
 CONFIG_ESP_HTTPS_SERVER_ENABLE=y
 
+# Pin the lwIP TCP/IP task to CPU1, alongside the httpd server, so the whole
+# network-serving path is isolated from the USB+Wi-Fi+system tasks on CPU0.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+
 # Give mbedTLS room for cert generation
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# Cert generation (PSA keygen + X.509 write) runs on main_task with ~2 KB of
+# local PEM buffers and a deep PSA/x509 call chain; the 3584-byte default stack
+# overflows and corrupts the PSA key-slot mutex. Give it real headroom.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Hardware SHA acceleration. vc_derive_key does PBKDF2 (100k iterations) via the
+# classic mbedtls_md/mbedtls_sha256 path, which uses this hardware engine -- fast
+# (<1s) with no per-op allocation. (The PSA SHA *driver* does malloc per hash, but
+# the KDF no longer goes through PSA, so that path is not exercised here.)
+CONFIG_MBEDTLS_HARDWARE_SHA=y
 
 # Required for runtime self-signed X.509 cert writing (vault_cert); defaults to n in v6
 CONFIG_MBEDTLS_X509_CREATE_C=y

@@ -3,8 +3,8 @@
 A personal encrypted credential vault that runs on a bare ESP32-S3 dev board.
 You reach it from a browser over HTTPS — on the device's own WiFi hotspot or
 over the USB cable — unlock it with a master password, and manage your
-credentials. A second "transfer password" lets you export an encrypted bundle
-and move your credentials to another ESP32-S3.
+credentials. A second "transfer password" gates a plaintext export you can use
+to migrate your credentials to another ESP32-S3 or to another password manager.
 
 Built with ESP-IDF v6.0.1.
 
@@ -18,9 +18,12 @@ Built with ESP-IDF v6.0.1.
     PC's WiFi stays on the internet)
 - Add / edit / delete credentials; secrets revealed per-entry on demand.
 - Change the master password without re-encrypting every entry.
-- Device-to-device export/import, protected by a separate transfer password.
-- Session hardening: HttpOnly + Secure + SameSite cookie, idle auto-lock, and
-  login rate-limiting / lockout.
+- Plaintext JSON export/import for migrating to another device or password
+  manager; export is gated by a separate transfer password.
+- Session hardening: HttpOnly + Secure + SameSite cookie, 3-minute idle
+  auto-lock (actively enforced), and login rate-limiting / lockout.
+- Onboard RGB status LED indicating vault state, with a green fade counting
+  down to idle auto-lock (see [Status LED](#status-led)).
 
 ## Security model
 
@@ -32,10 +35,12 @@ Two passwords are set during first-run setup:
   (AES-256-GCM, unique nonce per entry). The DEK lives in RAM only while
   unlocked and is wiped on logout, idle timeout, or reboot. Neither password is
   ever stored in plaintext.
-- **Transfer password** — gates and encrypts the export bundle. The bundle is
-  self-contained (encrypted under a key derived from the transfer password) and
-  not tied to any device's DEK, so it is portable. Set the same transfer
-  password on two devices and export → import works directly between them.
+- **Transfer password** — a confirmation gate for export. Export requires it,
+  but the resulting file is **plaintext JSON, not encrypted** — every secret is
+  readable, by design, so the export can be imported into other password
+  managers. Treat the file as sensitive: store it safely and delete it when
+  done. Import does not require the transfer password (the file is already
+  plaintext and the session cookie already grants full write access).
 
 Cryptography uses the PSA Crypto API (the classic mbedTLS primitives are private
 in ESP-IDF v6). The TLS server uses a self-signed EC P-256 certificate generated
@@ -46,6 +51,9 @@ on first boot and stored on the device — your browser will show a one-time
 
 - An ESP32-S3 dev board with PSRAM and at least 4 MB flash.
 - A USB cable (also used for the USB network interface).
+- Optional: an onboard WS2812 ("NeoPixel") RGB LED for the status indicator —
+  GPIO48 on the ESP32-S3-DevKitC-1 (some boards use GPIO38). The vault runs fine
+  without one.
 
 PSRAM defaults to Octal mode (`CONFIG_SPIRAM_MODE_OCT`). If your module uses
 Quad PSRAM, change that in `sdkconfig.defaults` and delete `sdkconfig` to
@@ -81,8 +89,32 @@ The first build compiles all of ESP-IDF and can take 10-20 minutes.
    password. Create both.
 4. Unlock with the master password to view, add, edit, delete, and reveal
    credentials.
-5. Transfer screen: enter the transfer password to download an encrypted export
-   file, or to import a file exported from another device.
+5. Transfer screen: enter the transfer password to download a **plaintext** JSON
+   export (`esp32key-export.json` — keep it safe), or import a JSON file from
+   another device or password manager.
+
+## Status LED
+
+If the board has an onboard WS2812 RGB LED (GPIO48), it shows the vault's
+security state at a glance, at low brightness:
+
+| LED               | Meaning                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| **Blue**          | No vault yet — run first-time setup                            |
+| **Red**           | Locked                                                         |
+| **Blinking red**  | Unlocking — the PBKDF2 key derivation takes ~1 s               |
+| **Green**         | Unlocked                                                       |
+
+While unlocked, the green **fades from bright to dark over the 3-minute idle
+window** as auto-lock approaches; any web-UI activity resets it to full
+brightness. When the idle timer expires the vault auto-locks (the DEK is wiped
+from RAM) and the LED returns to **red**.
+
+The indicator is driven by the `status_led` component, which mirrors live vault
+state on a timer — no per-request hooks. The pin is `LED_GPIO` in
+`components/status_led/status_led.c`; change it to `38` for boards that wire the
+LED there. If LED init fails the vault still runs normally, just without the
+indicator.
 
 ## Project layout
 
@@ -92,6 +124,7 @@ components/
   vault_store/    NVS persistence
   vault/          credential model: setup/unlock/lock/CRUD, change-pw, export/import
   vault_session/  session tokens, idle timeout, login lockout
+  status_led/     onboard WS2812 status indicator (vault state + idle countdown)
   vault_cert/     self-signed TLS cert generation + persistence
   net_wifi_ap/    WiFi softAP bring-up
   net_usb/        TinyUSB NCM network interface + DHCP server
@@ -118,6 +151,8 @@ At the Unity menu, run each suite: `[vault_crypto]`, `[vault_store]`,
 - App-level encryption only; ESP32 hardware flash-encryption / secure boot is
   not enabled (a possible future hardening step).
 - Decrypted secrets may linger in scratch RAM after lock until overwritten.
+- Export files are plaintext (for portability) — anyone with the file can read
+  every secret. Handle and delete them accordingly.
 - No Settings screen yet: the change-master-password API exists but has no UI,
   and the WiFi AP password is currently hardcoded in `main/main.c`.
 

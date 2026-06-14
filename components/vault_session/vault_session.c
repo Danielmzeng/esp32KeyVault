@@ -58,14 +58,29 @@ void vsess_create(uint64_t now_ms, char out_token_hex[VS_TOKEN_HEX])
     strcpy(out_token_hex, s_token);
 }
 
-bool vsess_validate(const char *token_hex, uint64_t now_ms)
+bool vsess_check_idle(uint64_t now_ms)
 {
-    if (!s_active || !token_hex || token_hex[0] == '\0') return false;
+    if (!s_active) return false;
     if (now_ms - s_last_seen_ms > VS_IDLE_MS) {
         vsess_destroy();
         if (s_expiry_cb) s_expiry_cb();   /* e.g. vault_lock(): wipe DEK on idle */
-        return false;
+        return true;
     }
+    return false;
+}
+
+uint32_t vsess_idle_remaining_ms(uint64_t now_ms)
+{
+    if (!s_active) return 0;
+    uint64_t elapsed = now_ms - s_last_seen_ms;
+    if (elapsed >= VS_IDLE_MS) return 0;
+    return (uint32_t)(VS_IDLE_MS - elapsed);
+}
+
+bool vsess_validate(const char *token_hex, uint64_t now_ms)
+{
+    if (!s_active || !token_hex || token_hex[0] == '\0') return false;
+    if (vsess_check_idle(now_ms)) return false;
     if (!ct_eq(token_hex, s_token)) return false;
     s_last_seen_ms = now_ms;
     return true;

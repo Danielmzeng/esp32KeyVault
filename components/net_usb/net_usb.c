@@ -63,6 +63,11 @@ esp_err_t net_usb_start(void)
     memcpy(net_cfg.mac_addr, mac, 6);
     ESP_ERROR_CHECK(tinyusb_net_init(TINYUSB_USBDEV_0, &net_cfg));
 
+    /* Bring the interface up AND mark the link connected. Unlike the Wi-Fi AP,
+     * this hand-rolled driver has no event handlers to drive the lifecycle, so
+     * without action_connected the netif stays "started but not connected" and
+     * the DHCP server never starts -> the USB host gets no 10.10.0.x lease. */
     esp_netif_action_start(s_usb_netif, NULL, 0, NULL);
+    esp_netif_action_connected(s_usb_netif, NULL, 0, NULL);
     return ESP_OK;
 }

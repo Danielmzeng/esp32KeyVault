@@ -1,5 +1,8 @@
 #include "vault_crypto.h"
 #include "psa/crypto.h"
+#include "sha/sha_core.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 esp_err_t vc_init(void)
@@ -7,50 +10,78 @@ esp_err_t vc_init(void)
     return (psa_crypto_init() == PSA_SUCCESS) ? ESP_OK : ESP_FAIL;
 }
 
+/* HMAC-SHA256 hash block size. */
+#define HMAC_BLK 64
+
+/* PBKDF2-HMAC-SHA256 built directly on the ESP hardware SHA engine (esp_sha).
+ *
+ * Both the PSA key-derivation path and the mbedtls_md path route every hash
+ * setup through the PSA SHA driver, which heap-allocates a DMA context per op;
+ * doing that ~200k times for 100k iterations takes ~20s and trips the task
+ * watchdog. esp_sha() drives the accelerator directly (no PSA, no per-op
+ * malloc), so 100k iterations complete in well under a second.
+ *
+ * VC_KEY_LEN (32) equals the SHA-256 output, so the derived key is PBKDF2 block 1:
+ *   U1 = HMAC(pw, salt || INT32BE(1)); Ui = HMAC(pw, U(i-1)); key = U1 ^ ... ^ Uc.
+ * HMAC(pw, m) = SHA256(k_opad || SHA256(k_ipad || m)), pads precomputed once. */
 esp_err_t vc_derive_key(const char *password, size_t password_len,
                         const uint8_t salt[VC_SALT_LEN], uint32_t iterations,
                         uint8_t out_key[VC_KEY_LEN])
 {
     if (!password || !salt || !out_key) return ESP_ERR_INVALID_ARG;
+    _Static_assert(VC_KEY_LEN == 32, "single-block PBKDF2 assumes 32-byte key");
 
-    psa_status_t status;
-    psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-    psa_key_id_t key_id = 0;
-    psa_key_derivation_operation_t op = PSA_KEY_DERIVATION_OPERATION_INIT;
+    /* inner message is salt||idx (VC_SALT_LEN+4) for U1, or a 32-byte U thereafter;
+     * size the buffer for whichever is larger. */
+#define VC_INNER_MSG_MAX ((VC_SALT_LEN + 4) > 32 ? (VC_SALT_LEN + 4) : 32)
+    uint8_t kb[HMAC_BLK] = {0}, k_ipad[HMAC_BLK], k_opad[HMAC_BLK];
+    uint8_t inner_in[HMAC_BLK + VC_INNER_MSG_MAX];  /* k_ipad || (salt||idx) or (U) */
+    uint8_t outer_in[HMAC_BLK + 32];                /* k_opad || inner-digest */
+    uint8_t u[32], t[32];
 
-    /* Import the password as a PSA PASSWORD key */
-    psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_DERIVE);
-    psa_set_key_algorithm(&attrs, PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256));
-    psa_set_key_type(&attrs, PSA_KEY_TYPE_PASSWORD);
-    psa_set_key_bits(&attrs, PSA_BYTES_TO_BITS(password_len));
+    /* Key block: K zero-padded to 64B, or SHA256(K) if longer than the block. */
+    if (password_len > HMAC_BLK) {
+        esp_sha(SHA2_256, (const unsigned char *)password, password_len, kb);
+    } else {
+        memcpy(kb, password, password_len);
+    }
+    for (int i = 0; i < HMAC_BLK; i++) { k_ipad[i] = kb[i] ^ 0x36; k_opad[i] = kb[i] ^ 0x5c; }
+    memcpy(outer_in, k_opad, HMAC_BLK);
 
-    status = psa_import_key(&attrs, (const uint8_t *)password, password_len, &key_id);
-    if (status != PSA_SUCCESS) return ESP_FAIL;
+    /* U1 = HMAC(pw, salt || INT32BE(1)) */
+    memcpy(inner_in, k_ipad, HMAC_BLK);
+    memcpy(inner_in + HMAC_BLK, salt, VC_SALT_LEN);
+    inner_in[HMAC_BLK + VC_SALT_LEN + 0] = 0;
+    inner_in[HMAC_BLK + VC_SALT_LEN + 1] = 0;
+    inner_in[HMAC_BLK + VC_SALT_LEN + 2] = 0;
+    inner_in[HMAC_BLK + VC_SALT_LEN + 3] = 1;
+    esp_sha(SHA2_256, inner_in, HMAC_BLK + VC_SALT_LEN + 4, outer_in + HMAC_BLK);
+    esp_sha(SHA2_256, outer_in, HMAC_BLK + 32, u);
+    memcpy(t, u, sizeof t);
 
-    /* Set up PBKDF2-HMAC-SHA256 derivation */
-    status = psa_key_derivation_setup(&op, PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256));
-    if (status != PSA_SUCCESS) goto cleanup_key;
+    /* Ui = HMAC(pw, U(i-1)); T ^= Ui.
+     * Every SHA op on this chip funnels through the PSA driver's per-op hardware
+     * acquire/clock-enable, so a 100k-iteration derivation runs many seconds and
+     * would starve the idle task. Yield briefly every 1024 iterations so the idle
+     * task runs and the task watchdog stays satisfied, whatever the iteration count. */
+    for (uint32_t i = 1; i < iterations; i++) {
+        memcpy(inner_in + HMAC_BLK, u, 32);
+        esp_sha(SHA2_256, inner_in, HMAC_BLK + 32, outer_in + HMAC_BLK);
+        esp_sha(SHA2_256, outer_in, HMAC_BLK + 32, u);
+        for (size_t k = 0; k < sizeof t; k++) t[k] ^= u[k];
+        if ((i & 0x3FF) == 0) vTaskDelay(1);
+    }
 
-    status = psa_key_derivation_input_integer(&op, PSA_KEY_DERIVATION_INPUT_COST,
-                                              iterations);
-    if (status != PSA_SUCCESS) goto cleanup_op;
+    memcpy(out_key, t, VC_KEY_LEN);
 
-    status = psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_SALT,
-                                            salt, VC_SALT_LEN);
-    if (status != PSA_SUCCESS) goto cleanup_op;
-
-    status = psa_key_derivation_input_key(&op, PSA_KEY_DERIVATION_INPUT_PASSWORD,
-                                          key_id);
-    if (status != PSA_SUCCESS) goto cleanup_op;
-
-    status = psa_key_derivation_output_bytes(&op, out_key, VC_KEY_LEN);
-
-cleanup_op:
-    psa_key_derivation_abort(&op);
-cleanup_key:
-    psa_destroy_key(key_id);
-
-    return (status == PSA_SUCCESS) ? ESP_OK : ESP_FAIL;
+    memset(kb, 0, sizeof kb);
+    memset(k_ipad, 0, sizeof k_ipad);
+    memset(k_opad, 0, sizeof k_opad);
+    memset(inner_in, 0, sizeof inner_in);
+    memset(outer_in, 0, sizeof outer_in);
+    memset(u, 0, sizeof u);
+    memset(t, 0, sizeof t);
+    return ESP_OK;
 }
 
 #include "esp_random.h"

@@ -4,6 +4,7 @@
 #include "psa/crypto.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/x509_crt.h"
+#include "mbedtls/x509.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -32,11 +33,19 @@
 
 #define CERT_KEY "cert_pem"
 #define PKEY_KEY "key_pem"
+#define CVER_KEY "cert_ver"
 #define DN       "CN=esp32key.local,O=esp32key"
+
+/* Bump when the cert contents change (e.g. SANs) so cached certs regenerate. */
+#define CERT_SCHEMA_VERSION 2
 
 /* not_before / not_after in UTC "YYYYMMDDhhmmss" format. */
 #define NOT_BEFORE "20240101000000"
 #define NOT_AFTER  "20440101000000"
+
+/* SubjectAltName IP addresses (raw 4-byte form): WiFi AP and USB-NCM. */
+static const unsigned char SAN_IP_WIFI[4] = {192, 168, 4, 1};
+static const unsigned char SAN_IP_USB[4]  = {10, 10, 0, 1};
 
 static esp_err_t generate(char **cert_pem, size_t *cert_len,
                           char **key_pem, size_t *key_len)
@@ -49,6 +58,21 @@ static esp_err_t generate(char **cert_pem, size_t *cert_len,
     unsigned char keybuf[1024] = {0};
     unsigned char crtbuf[1024] = {0};
     const unsigned char serial[] = {0x01};
+
+    /* SubjectAltName chain: hostname + both service IPs. Declared up front so no
+     * goto-to-cleanup jumps over an initializer. */
+    mbedtls_x509_san_list san_usb = {
+        .node = { .type = MBEDTLS_X509_SAN_IP_ADDRESS,
+                  .san.unstructured_name = { .p = (unsigned char *)SAN_IP_USB, .len = 4 } },
+        .next = NULL };
+    mbedtls_x509_san_list san_wifi = {
+        .node = { .type = MBEDTLS_X509_SAN_IP_ADDRESS,
+                  .san.unstructured_name = { .p = (unsigned char *)SAN_IP_WIFI, .len = 4 } },
+        .next = &san_usb };
+    mbedtls_x509_san_list san_dns = {
+        .node = { .type = MBEDTLS_X509_SAN_DNS_NAME,
+                  .san.unstructured_name = { .p = (unsigned char *)"esp32key.local", .len = 14 } },
+        .next = &san_wifi };
 
     mbedtls_pk_init(&key);
     mbedtls_x509write_crt_init(&crt);
@@ -92,6 +116,7 @@ static esp_err_t generate(char **cert_pem, size_t *cert_len,
     if (mbedtls_x509write_crt_set_basic_constraints(&crt, 1, -1) != 0) goto done;
     if (mbedtls_x509write_crt_set_subject_key_identifier(&crt) != 0) goto done;
     if (mbedtls_x509write_crt_set_authority_key_identifier(&crt) != 0) goto done;
+    if (mbedtls_x509write_crt_set_subject_alternative_name(&crt, &san_dns) != 0) goto done;
 
     /* PEM-encode the cert. No RNG argument in mbedTLS 4.x. */
     if (mbedtls_x509write_crt_pem(&crt, crtbuf, sizeof crtbuf) != 0) {
@@ -111,8 +136,10 @@ static esp_err_t generate(char **cert_pem, size_t *cert_len,
     memcpy(*key_pem, keybuf, *key_len);
     memcpy(*cert_pem, crtbuf, *cert_len);
 
+    uint8_t cver = CERT_SCHEMA_VERSION;
     if (vs_set_blob(PKEY_KEY, *key_pem, *key_len) == ESP_OK &&
         vs_set_blob(CERT_KEY, *cert_pem, *cert_len) == ESP_OK &&
+        vs_set_blob(CVER_KEY, &cver, sizeof cver) == ESP_OK &&
         vs_commit() == ESP_OK) {
         result = ESP_OK;
     } else {
@@ -136,8 +163,15 @@ esp_err_t vault_cert_get(char **cert_pem, size_t *cert_len,
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Only reuse a cached cert that matches the current schema; otherwise
+     * regenerate (e.g. to pick up newly added SANs) without touching the vault. */
+    uint8_t cver = 0; size_t cvlen = sizeof cver;
+    bool cver_ok = (vs_get_blob(CVER_KEY, &cver, &cvlen) == ESP_OK &&
+                    cver == CERT_SCHEMA_VERSION);
+
     size_t clen = 0, klen = 0;
-    if (vs_get_blob(CERT_KEY, NULL, &clen) == ESP_OK &&
+    if (cver_ok &&
+        vs_get_blob(CERT_KEY, NULL, &clen) == ESP_OK &&
         vs_get_blob(PKEY_KEY, NULL, &klen) == ESP_OK) {
         *cert_pem = malloc(clen);
         *key_pem  = malloc(klen);
