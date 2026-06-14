@@ -88,6 +88,8 @@ static esp_err_t h_state(httpd_req_t *r)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "initialized", vault_is_initialized());
     cJSON_AddBoolToObject(o, "unlocked", authed(r) && vault_is_unlocked());
+    /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
+    cJSON_AddNumberToObject(o, "idle_ms", VS_IDLE_MS);
     return send_json(r, 200, o);
 }
 
@@ -298,6 +300,7 @@ static esp_err_t h_change_pw(httpd_req_t *r)
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     const char *cur = json_str(j,"current"), *next = json_str(j,"next");
+    if (next[0] == '\0') { cJSON_Delete(j); return err_json(r,400,"new password required"); }
     esp_err_t e = vault_change_password(cur, strlen(cur), next, strlen(next));
     cJSON_Delete(j);
     if (e != ESP_OK) return err_json(r,403,"wrong current password");
@@ -314,6 +317,7 @@ static esp_err_t h_change_transfer(httpd_req_t *r)
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     const char *cur = json_str(j,"current"), *next = json_str(j,"next");
+    if (next[0] == '\0') { cJSON_Delete(j); return err_json(r,400,"new password required"); }
     esp_err_t e = ESP_FAIL;
     bool ok = vault_verify_transfer(cur, strlen(cur));
     if (ok) e = vault_set_transfer_password(next, strlen(next));
