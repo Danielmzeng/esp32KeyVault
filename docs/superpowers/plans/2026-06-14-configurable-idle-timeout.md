@@ -46,7 +46,11 @@ Set-Location D:\Workspace\esp32key\test_app; $env:MSYSTEM = $null; . C:\esp\v6.0
 **Files:**
 - Modify: `components/vault_session/include/vault_session.h`
 - Modify: `components/vault_session/vault_session.cpp`
+- Modify: `components/status_led/status_led.cpp` (also referenced the renamed `VS_IDLE_MS`)
+- Modify: `components/vault_api/vault_api.cpp` (the `/api/state` read — only remaining `VS_IDLE_MS` use; the rename is atomic across the tree because `test_app` compiles every component)
 - Test: `components/vault_session/test/test_vault_session.cpp`
+
+> **Note (revised during execution):** Renaming `VS_IDLE_MS` breaks every call site, and both projects compile all components, so the rename must touch all consumers in one commit to keep the tree buildable: `status_led.cpp:green_level()` (use `session_.idle_ms()` as the fade's full-scale window) and `vault_api.cpp` `h_state_impl` (report `session_.idle_ms()`). The `/api/state` change was originally Task 2 Step 3; it moves here.
 
 - [ ] **Step 1: Update the test file to the new API (the failing test)**
 
@@ -265,18 +269,9 @@ And after the `h_state` line in the static-trampoline group:
     static esp_err_t h_idle_set(httpd_req_t*);
 ```
 
-- [ ] **Step 3: `/api/state` reports the runtime value**
+- [ ] **Step 3: `/api/state` reports the runtime value** — DONE IN TASK 1.
 
-In `components/vault_api/vault_api.cpp`, in `h_state_impl`, replace:
-```cpp
-    /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
-    cJSON_AddNumberToObject(o, "idle_ms", VS_IDLE_MS);
-```
-with:
-```cpp
-    /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
-    cJSON_AddNumberToObject(o, "idle_ms", session_.idle_ms());
-```
+The `h_state_impl` change (`idle_ms` now reports `session_.idle_ms()`) was folded into Task 1 to keep the tree buildable after the `VS_IDLE_MS` rename. No action here; verify it is present.
 
 - [ ] **Step 4: Add the `h_idle_set_impl` handler**
 
