@@ -1,8 +1,10 @@
 #include "doctest/doctest.h"
 #include "vault.h"
 #include "vault_store.h"
+#include "vault_error.h"        // vault::Error (CHECK_THROWS_AS)
 #include <cstring>
 #include <cstdlib>
+#include <initializer_list>     // braced-init range-for in fresh()
 
 using namespace vault;
 
