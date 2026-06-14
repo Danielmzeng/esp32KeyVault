@@ -110,7 +110,9 @@ void StatusLed::init()
         return;          /* non-fatal: the vault works without the indicator */
     }
 
-    tick();              /* show the current state at once */
+    tick_trampoline(this);   /* show the current state at once; via the trampoline so a
+                                transient NVS fault in the state read can't escape and abort
+                                boot -- the LED indicator is non-fatal */
 
     esp_timer_create_args_t targs = {};
     targs.callback = tick_trampoline;

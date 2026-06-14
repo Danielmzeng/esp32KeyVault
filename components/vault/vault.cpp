@@ -544,6 +544,8 @@ bool Vault::import_bundle(const char *transfer_pw, size_t len,
 }
 
 Vault::~Vault() {
+    lock();   /* zeroize the DEK and the decrypted-entry / scratch buffers before
+                 returning them to the heap, so secrets don't outlive the vault */
     if (entries_)  { free(entries_);  entries_ = nullptr; }
     if (io_plain_) { free(io_plain_); io_plain_ = nullptr; }
     if (io_blob_)  { free(io_blob_);  io_blob_ = nullptr; }
