@@ -41,6 +41,9 @@ let idleTimer;
 let idleMs = 3*60*1000;            /* updated from the server's idle_ms in boot() */
 function armIdle(){ clearTimeout(idleTimer); idleTimer = setTimeout(boot, idleMs + 5000); }
 function stopIdle(){ clearTimeout(idleTimer); }
+/* Lock the vault: log out, then return to the unlock screen. Shared by the Lock
+ * button and the clickable logo on every unlocked view. */
+async function lock(){ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); }
 
 async function api(path, opts={}) {
   const r = await fetch(path, {credentials:'same-origin', headers:{'Content-Type':'application/json'}, ...opts});
@@ -208,7 +211,6 @@ function paint() {
   };
   $('#xfer').onclick = renderTransfer;
   $('#settings').onclick = renderSettings;
-  const lock = async()=>{ try{ await api('/api/logout',{method:'POST'}); }catch(e){} boot(); };
   $('#lock').onclick = lock;
   $('#logolock').onclick = lock;   /* clicking the sidebar logo also locks */
 }
@@ -309,7 +311,7 @@ function renderReset() {
 }
 
 function renderTransfer() {
-  $('#app').innerHTML = `<img class=logo src="${LOGO}" alt="esp32key">
+  $('#app').innerHTML = `<img class=logo id=logolock src="${LOGO}" alt="esp32key" title="Lock" style="cursor:pointer">
     <h2>Transfer</h2>
     <h3>Export</h3>
     <p class=warn>Warning: the export file is plaintext — every password is readable. Store it somewhere safe and delete it when done.</p>
@@ -321,6 +323,7 @@ function renderTransfer() {
     <div class=row><button id=back>Back</button></div>
     <div class=err id=e></div>`;
   $('#back').onclick = renderVault;
+  $('#logolock').onclick = lock;   /* clicking the logo locks */
   $('#exp').onclick = async () => {
     try {
       const r = await fetch('/api/export', {method:'POST', credentials:'same-origin',
