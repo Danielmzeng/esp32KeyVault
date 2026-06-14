@@ -39,7 +39,7 @@ extern "C" void app_main(void)
         // `vault` has static storage duration, so the lambda uses it without capturing.
         session.set_expiry_cb([] { vault.lock(); });
 
-        static vault::WifiAp wifi; wifi.start(AP_PASSWORD);
+        static vault::WifiAp wifi(store); wifi.start("esp32key", AP_PASSWORD);
         static vault::UsbNet usb;  usb.start();
 
         static vault::Cert cert(store);
