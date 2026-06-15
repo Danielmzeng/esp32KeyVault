@@ -93,7 +93,7 @@ function renderLogin() {
     $('#go').disabled = true; $('#pw').disabled = true;
     /* No real progress is reported by the server, so estimate the fill from how long
      * the last successful unlock took (key derivation time is fairly stable per vault). */
-    const est = Math.max(2000, Number(localStorage.getItem('unlockMs')) || 8000);
+    const est = Math.max(2000, Number(lsGet('unlockMs')) || 8000);
     const t0 = performance.now();
     const bar = $('#prog > span');
     $('#prog').classList.add('on');
@@ -104,7 +104,7 @@ function renderLogin() {
     }, 100);
     try {
       await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#pw').value})});
-      localStorage.setItem('unlockMs', Math.round(performance.now() - t0));
+      lsSet('unlockMs', Math.round(performance.now() - t0));
       clearInterval(tick); bar.style.width = '100%';
       boot();
     } catch(e){
@@ -375,32 +375,38 @@ function renderTransfer() {
     $('#exp').disabled = true;
     /* The wait is the server re-deriving the transfer key (no progress is reported),
      * so estimate the fill from how long the last successful export took. */
-    const est = Math.max(2000, Number(localStorage.getItem('exportMs')) || 8000);
+    const est = Math.max(2000, Number(lsGet('exportMs')) || 8000);
     const t0 = performance.now();
-    const bar = $('#eprog > span');
+    const prog = $('#eprog'), btn = $('#exp'), bar = prog.querySelector('span');
     bar.style.width = '0';
-    $('#eprog').classList.add('on');
+    prog.classList.add('on');
     const tick = setInterval(() => {
       const frac = Math.min(0.9, (performance.now() - t0) / est * 0.9);
       bar.style.width = (frac * 100).toFixed(1) + '%';
     }, 100);
+    /* The user can leave this page (Back / logo-lock) mid-export; once #app is
+     * re-rendered these nodes are detached, so skip all DOM writes if so. */
+    const onPage = () => document.body.contains(prog);
     try {
       const r = await fetch('/api/export', {method:'POST', credentials:'same-origin',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({transfer_password:$('#epw').value})});
       if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || r.statusText);
       const blob = await r.blob();
-      localStorage.setItem('exportMs', Math.round(performance.now() - t0));
-      clearInterval(tick); bar.style.width = '100%';
+      lsSet('exportMs', Math.round(performance.now() - t0));
+      clearInterval(tick);
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob); a.download = 'esp32key-export.json'; a.click();
       URL.revokeObjectURL(a.href);
-      $('#exp').disabled = false; exporting = false;
+      if (onPage()) { bar.style.width = '100%'; btn.disabled = false; }
+      exporting = false;
     } catch(e){
       clearInterval(tick);
-      $('#eprog').classList.remove('on'); bar.style.width = '0';
-      $('#exp').disabled = false; exporting = false;
-      $('#e').textContent = e.message;
+      exporting = false;
+      if (onPage()) {
+        prog.classList.remove('on'); bar.style.width = '0';
+        btn.disabled = false; $('#e').textContent = e.message;
+      }
     }
   };
   $('#imp').onclick = async () => {
@@ -414,6 +420,9 @@ function renderTransfer() {
   };
 }
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* localStorage access can throw (storage disabled / sandboxed contexts); never let it break a flow. */
+const lsGet = k => { try { return localStorage.getItem(k); } catch(_){ return null; } };
+const lsSet = (k,v) => { try { localStorage.setItem(k,v); } catch(_){} };
 /* Generate a random secret using the CSPRNG, with rejection sampling to avoid modulo bias. */
 function genSecret(len) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}';
