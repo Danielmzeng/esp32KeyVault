@@ -5,6 +5,7 @@
 #include "vault_error.h"
 #include "esp_https_server.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,15 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 
 namespace {
+
+/* NVS key for the persisted idle auto-lock window (<=15 chars). Single source
+ * for both the write (h_idle_set_impl) and the boot-load read (start()). */
+static const char IDLE_MS_KEY[] = "idle_ms";
+
+/* One-shot esp_timer callback: reboot so a saved AP-credential change takes
+ * effect. Armed ~2 s out (after the 200 is sent) so the HTTP response flushes
+ * before the restart. */
+static void reboot_cb(void*) { esp_restart(); }
 
 static uint64_t now_ms(void) { return (uint64_t)(esp_timer_get_time() / 1000); }
 
@@ -141,8 +151,69 @@ esp_err_t ApiServer::h_state_impl(httpd_req_t *r)
     cJSON_AddBoolToObject(o, "initialized", vault_.is_initialized());
     cJSON_AddBoolToObject(o, "unlocked", authed(r) && vault_.is_unlocked());
     /* Let the client mirror the server's idle auto-lock instead of hardcoding it. */
-    cJSON_AddNumberToObject(o, "idle_ms", VS_IDLE_MS);
+    cJSON_AddNumberToObject(o, "idle_ms", session_.idle_ms());
     return send_json(r, 200, o);
+}
+
+/* ---- POST /api/idle ---- set idle auto-lock window (seconds), authed + persisted */
+esp_err_t ApiServer::h_idle_set_impl(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r, 401, "locked");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    int secs = json_int(j, "seconds");
+    cJSON_Delete(j);
+    /* Validate against the canonical bounds (in ms) so the window is defined in
+     * one place. Checking seconds before multiplying also avoids uint32 overflow. */
+    if (secs < (int)(VS_IDLE_MIN_MS / 1000) || secs > (int)(VS_IDLE_MAX_MS / 1000))
+        return err_json(r,400,"timeout out of range (30-3600s)");
+    uint32_t ms = (uint32_t)secs * 1000u;
+    /* Persist first: if the NVS write throws (-> 500 via trampoline) the live
+     * window is left unchanged, so the RAM value never diverges from what the
+     * client was told failed. secs is pre-validated in range, so set_idle_ms
+     * stores it as-is. */
+    store_.set_blob(IDLE_MS_KEY, &ms, sizeof ms);
+    store_.commit();
+    session_.set_idle_ms(ms);
+    return send_json(r, 200, cJSON_CreateObject());
+}
+
+/* ---- GET /api/wifi ---- current AP SSID (authed). Password is never returned. */
+esp_err_t ApiServer::h_wifi_get_impl(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r, 401, "locked");
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "ssid", wifi_.ssid());
+    return send_json(r, 200, o);
+}
+
+/* ---- POST /api/wifi ---- set AP SSID+password (authed), persist, then reboot. */
+esp_err_t ApiServer::h_wifi_set_impl(httpd_req_t *r)
+{
+    if (!authed(r)) return err_json(r, 401, "locked");
+    char *body = read_body(r); if (!body) return err_json(r,400,"bad body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return err_json(r,400,"bad json");
+    const char *ssid_s = json_str(j, "ssid");
+    const char *pw_s   = json_str(j, "password");
+    size_t sl = strlen(ssid_s), pl = strlen(pw_s);
+    if (sl < 1 || sl > 32) { cJSON_Delete(j); return err_json(r,400,"ssid must be 1-32 chars"); }
+    if (pl < 8 || pl > 63) { cJSON_Delete(j); return err_json(r,400,"password must be 8-63 chars"); }
+    /* Copy out before freeing j; lengths are validated so these can't truncate. */
+    char ssid[33], pw[64];
+    strlcpy(ssid, ssid_s, sizeof ssid);
+    strlcpy(pw,   pw_s,   sizeof pw);
+    cJSON_Delete(j);
+    wifi_.set_credentials(ssid, pw);   // throws on NVS fault -> 500 via trampoline
+    /* Send the 200 first, THEN arm the reboot, so esp_restart can't clip the
+     * in-flight TLS write; the ~2 s delay gives the response time to reach the
+     * client (which is likely connected through the AP being reconfigured). */
+    esp_err_t sent = send_json(r, 200, cJSON_CreateObject());
+    esp_timer_create_args_t ra = {}; ra.callback = reboot_cb; ra.name = "reboot";
+    esp_timer_handle_t rt;
+    if (esp_timer_create(&ra, &rt) == ESP_OK) esp_timer_start_once(rt, 2000ULL * 1000);
+    return sent;
 }
 
 /* ---- /api/setup ---- */
@@ -564,6 +635,9 @@ void ApiServer::idle_timer_cb(void *arg)
  * static member converts to the plain function pointer httpd expects. */
 namespace vault {
 API_HANDLER(h_state)
+API_HANDLER(h_idle_set)
+API_HANDLER(h_wifi_get)
+API_HANDLER(h_wifi_set)
 API_HANDLER(h_setup)
 API_HANDLER(h_login)
 API_HANDLER(h_logout)
@@ -599,7 +673,7 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     cfg.servercert_len = cert_len;
     cfg.prvtkey_pem = (const uint8_t *)key_pem;
     cfg.prvtkey_len = key_len;
-    cfg.httpd.max_uri_handlers = 20;
+    cfg.httpd.max_uri_handlers = 24;
     cfg.httpd.uri_match_fn = uri_match_activity;
     /* Pin the server (TLS handshake + all API handlers) to CPU1, away from the
      * USB+Wi-Fi+system tasks that are all pinned to CPU0. */
@@ -611,6 +685,9 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     const httpd_uri_t routes[] = {
         {"/",                       HTTP_GET,    h_index,           this},
         {"/api/state",              HTTP_GET,    h_state,           this},
+        {"/api/idle",               HTTP_POST,   h_idle_set,        this},
+        {"/api/wifi",               HTTP_GET,    h_wifi_get,        this},
+        {"/api/wifi",               HTTP_POST,   h_wifi_set,        this},
         {"/api/setup",              HTTP_POST,   h_setup,           this},
         {"/api/login",              HTTP_POST,   h_login,           this},
         {"/api/logout",             HTTP_POST,   h_logout,          this},
@@ -631,7 +708,16 @@ void ApiServer::start(const char *cert_pem, size_t cert_len,
     for (auto& route : routes)
         httpd_register_uri_handler(srv_, &route);
 
-    /* Auto-lock after VS_IDLE_MS (3 min). Poll every 5 s so the lock (and the
+    /* Restore a previously-saved idle window; absent key keeps the default. */
+    {
+        uint32_t saved = 0; size_t len = sizeof saved;
+        try { if (store_.get_blob(IDLE_MS_KEY, &saved, len) && len == sizeof saved)
+                  session_.set_idle_ms(saved); }
+        catch (...) { ESP_LOGW(TAG, "idle_ms load failed; using default"); }
+    }
+
+    /* Auto-lock after the session idle window (default 3 min, runtime-configurable).
+     * Poll every 5 s so the lock (and the
      * LED's switch to red) lands promptly after the green fade bottoms out; the
      * lock itself runs on the httpd task (see idle_timer_cb) so it can't race a
      * live handler. */

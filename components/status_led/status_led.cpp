@@ -52,9 +52,11 @@ void StatusLed::draw(int code)
 uint32_t StatusLed::green_level()
 {
     uint64_t now = (uint64_t)(esp_timer_get_time() / 1000);
-    uint32_t rem = session_.idle_remaining_ms(now);   /* 0 .. VS_IDLE_MS */
-    if (rem > VS_IDLE_MS) rem = VS_IDLE_MS;
-    return G_MIN + (uint32_t)((uint64_t)rem * (LVL - G_MIN) / VS_IDLE_MS);
+    uint32_t win = session_.idle_ms();                /* current idle window (runtime-configurable) */
+    if (!win) return G_MIN;                            /* guard the divide locally (set_idle_ms floors it today) */
+    uint32_t rem = session_.idle_remaining_ms(now);   /* 0 .. win */
+    if (rem > win) rem = win;
+    return G_MIN + (uint32_t)((uint64_t)rem * (LVL - G_MIN) / win);
 }
 
 /* esp_timer callback: recover this from arg and never let an exception reach
