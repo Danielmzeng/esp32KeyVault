@@ -274,9 +274,13 @@ esp_err_t ApiServer::h_logout_impl(httpd_req_t *r)
 esp_err_t ApiServer::h_entries_list_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
-    static vault_entry_t list[VAULT_MAX_ENTRIES]; size_t n = 0;
+    /* Heap (not a static array): VAULT_MAX_ENTRIES * sizeof is ~82 KB and would
+     * otherwise sit permanently in internal .bss; >16 KB mallocs land in PSRAM. */
+    vault_entry_t *list = (vault_entry_t*)malloc(VAULT_MAX_ENTRIES * sizeof *list);
+    if (!list) return err_json(r,500,"oom");
+    size_t n = 0;
     try { n = vault_.list(list, VAULT_MAX_ENTRIES); }
-    catch (const vault::Error&) { return err_json(r,403,"locked"); }
+    catch (const vault::Error&) { free(list); return err_json(r,403,"locked"); }
     cJSON *o = cJSON_CreateObject(); cJSON *arr = cJSON_AddArrayToObject(o,"entries");
     for (size_t i=0;i<n;i++){ cJSON *e=cJSON_CreateObject();
         cJSON_AddNumberToObject(e,"id",list[i].id);
@@ -284,6 +288,7 @@ esp_err_t ApiServer::h_entries_list_impl(httpd_req_t *r)
         cJSON_AddStringToObject(e,"title",list[i].title);
         cJSON_AddStringToObject(e,"username",list[i].username);
         cJSON_AddItemToArray(arr,e); }
+    free(list);
     return send_json(r, 200, o);
 }
 
@@ -534,10 +539,13 @@ esp_err_t ApiServer::h_import_impl(httpd_req_t *r)
 {
     if (!authed(r)) return err_json(r,401,"unauthorized");
     /* Must exceed the largest file h_export can produce, or the device can't
-     * re-import its own export. Worst case: every char of every field escapes to
-     * \uXXXX (6 bytes); ~6*VAULT_MAX_ENTRIES*6*VAULT_FIELD_MAX plus structure,
-     * which is ~300 KB. 384 KB leaves headroom and is cheap from PSRAM. */
-    char *body = read_body_cap(r, 384 * 1024); if (!body) return err_json(r,400,"bad body");
+     * re-import its own export. Worst case: every char of all 6 fields escapes to
+     * \uXXXX (6 bytes), i.e. 6 * VAULT_MAX_ENTRIES * 6 * VAULT_FIELD_MAX, plus JSON
+     * structure (keys/indent/whitespace) covered by the +64 KB. Scales with
+     * VAULT_MAX_ENTRIES; read_body_cap only allocates the actual body, so a large
+     * cap costs nothing unless the upload is large, and that comes from PSRAM. */
+    const size_t import_cap = (size_t)VAULT_MAX_ENTRIES * 6 * VAULT_FIELD_MAX * 6 + 64 * 1024;
+    char *body = read_body_cap(r, import_cap); if (!body) return err_json(r,400,"bad body");
     cJSON *j = cJSON_Parse(body); free(body);
     if (!j) return err_json(r,400,"bad json");
     cJSON *arr = cJSON_GetObjectItem(j,"entries");

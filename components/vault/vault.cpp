@@ -333,7 +333,17 @@ uint8_t Vault::add(const char *title, const char *username, const char *secret,
     set_field(e->secret, secret);
     set_field(e->url, url);
     set_field(e->comment, comment);
-    persist_entries();
+    try {
+        persist_entries();
+    } catch (...) {
+        /* Persist failed (e.g. NVS full): roll back the in-RAM insert so the
+         * reported failure matches what the list returns and what survives a
+         * reboot. Without this the entry lingers in RAM and reappears on
+         * refresh despite "add failed". */
+        memset(e, 0, sizeof *e);
+        count_--;
+        throw;
+    }
     return e->id;
 }
 

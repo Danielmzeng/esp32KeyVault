@@ -5,7 +5,7 @@
 #include "vault_store.h"
 #include "vault_crypto.h"   // VC_KEY_LEN etc. for member buffers
 
-#define VAULT_MAX_ENTRIES     64
+#define VAULT_MAX_ENTRIES     128
 #define VAULT_FIELD_MAX       128
 #define VAULT_CAT_NAME_MAX    32
 #define VAULT_MAX_CATEGORIES  32
