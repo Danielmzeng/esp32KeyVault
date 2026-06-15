@@ -21,6 +21,9 @@ input,button,select{font-size:1rem;padding:.5rem;margin:.25rem 0;width:100%;box-
 .cat.on{background:#e3e3e3;font-weight:600}
 .cat .x{color:#b00;cursor:pointer;padding:0 .25rem;font-weight:400}
 .addcat{display:flex;gap:.3rem;margin-top:.5rem}.addcat input{margin:0}.addcat button{width:auto;white-space:nowrap}
+.prog{height:8px;background:#e3e3e3;border-radius:4px;overflow:hidden;margin:.5rem 0;display:none}
+.prog.on{display:block}
+.prog>span{display:block;height:100%;width:0;background:#2d7;border-radius:4px;transition:width .2s linear}
 @media(max-width:600px){.layout{flex-direction:column}.side{width:100%}}
 </style></head>
 <body><div id="app">Loading…</div>
@@ -79,10 +82,37 @@ function renderLogin() {
   $('#app').innerHTML = `<img class=logo src="${LOGO}" alt="esp32key">
     <h2>Unlock</h2>
     <input id=pw type=password placeholder="Master password">
-    <button id=go>Unlock</button><div class=err id=e></div>`;
+    <button id=go>Unlock</button>
+    <div class=prog id=prog><span></span></div>
+    <div class=err id=e></div>`;
+  let busy = false;
   const submit = async () => {
-    try { await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#pw').value})}); boot(); }
-    catch(e){ $('#e').textContent = e.message; }
+    if (busy) return;
+    busy = true;
+    $('#e').textContent = '';
+    $('#go').disabled = true; $('#pw').disabled = true;
+    /* No real progress is reported by the server, so estimate the fill from how long
+     * the last successful unlock took (key derivation time is fairly stable per vault). */
+    const est = Math.max(2000, Number(localStorage.getItem('unlockMs')) || 8000);
+    const t0 = performance.now();
+    const bar = $('#prog > span');
+    $('#prog').classList.add('on');
+    const tick = setInterval(() => {
+      /* Ease toward 90% over the estimate; never reach 100% until the response lands. */
+      const frac = Math.min(0.9, (performance.now() - t0) / est * 0.9);
+      bar.style.width = (frac * 100).toFixed(1) + '%';
+    }, 100);
+    try {
+      await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#pw').value})});
+      localStorage.setItem('unlockMs', Math.round(performance.now() - t0));
+      clearInterval(tick); bar.style.width = '100%';
+      boot();
+    } catch(e){
+      clearInterval(tick);
+      $('#prog').classList.remove('on'); bar.style.width = '0';
+      $('#go').disabled = false; $('#pw').disabled = false; busy = false;
+      $('#e').textContent = e.message;
+    }
   };
   $('#go').onclick = submit;
   $('#pw').onkeydown = e => { if (e.key === 'Enter') submit(); };
@@ -131,7 +161,8 @@ function paint() {
       <select id=ecat>${opts}</select>
       <input id=t placeholder=Title><input id=u placeholder=Username>
       <input id=eurl placeholder=URL>
-      <input id=s placeholder=Secret autocomplete="off" data-lpignore="true" data-1p-ignore data-form-type="other">
+      <div class=row><input id=s placeholder=Secret autocomplete="off" data-lpignore="true" data-1p-ignore data-form-type="other">
+        <button id=gen type=button>Generate</button></div>
       <input id=ecmt placeholder=Comment>
       <button id=add>Add</button><div class=err id=e></div>
     </div></div>`;
@@ -202,6 +233,7 @@ function paint() {
   document.querySelectorAll('.del').forEach(b=>b.onclick=async ev=>{
     const d=ev.target.closest('.entry'); await api(`/api/entries/${d.dataset.id}`,{method:'DELETE'}); renderVault();
   });
+  $('#gen').onclick = () => { $('#s').value = genSecret(20); };
   $('#add').onclick = async () => {
     try { await api('/api/entries',{method:'POST',body:JSON.stringify(
       {title:$('#t').value, username:$('#u').value, secret:$('#s').value,
@@ -225,7 +257,8 @@ async function renderSettings() {
     <h3>WiFi access point</h3>
     <p class=warn>Saving new WiFi settings restarts the device. You'll need to reconnect to the new network and unlock again.</p>
     <input id=apssid placeholder="AP name (SSID)" maxlength=32 value="${esc(ssid)}">
-    <input id=appw type=password placeholder="New AP password (8-63 chars)" autocomplete="off">
+    <div class=row><input id=appw type=password placeholder="New AP password (8-63 chars)" autocomplete="off">
+      <button id=appwtog type=button>Show</button></div>
     <button id=apsave>Save WiFi &amp; restart</button>
     <div class=warn id=apmsg></div>
     <h3>Auto-lock</h3>
@@ -240,6 +273,13 @@ async function renderSettings() {
   $('#back').onclick = renderVault;
   $('#goclear').onclick = renderClear;
   $('#goreset').onclick = renderReset;
+
+  $('#appwtog').onclick = () => {
+    const f = $('#appw'), b = $('#appwtog');
+    const show = f.type === 'password';
+    f.type = show ? 'text' : 'password';
+    b.textContent = show ? 'Hide' : 'Show';
+  };
 
   $('#apsave').onclick = async () => {
     const s = $('#apssid').value.trim(), p = $('#appw').value;
@@ -319,6 +359,7 @@ function renderTransfer() {
     <p class=warn>Warning: the export file is plaintext — every password is readable. Store it somewhere safe and delete it when done.</p>
     <input id=epw type=password placeholder="Transfer password">
     <button id=exp>Download export file</button>
+    <div class=prog id=eprog><span></span></div>
     <h3>Import</h3>
     <input id=file type=file accept="application/json,.json">
     <button id=imp>Import file</button>
@@ -326,17 +367,41 @@ function renderTransfer() {
     <div class=err id=e></div>`;
   $('#back').onclick = renderVault;
   $('#logolock').onclick = lock;   /* clicking the logo locks */
+  let exporting = false;
   $('#exp').onclick = async () => {
+    if (exporting) return;
+    exporting = true;
+    $('#e').textContent = '';
+    $('#exp').disabled = true;
+    /* The wait is the server re-deriving the transfer key (no progress is reported),
+     * so estimate the fill from how long the last successful export took. */
+    const est = Math.max(2000, Number(localStorage.getItem('exportMs')) || 8000);
+    const t0 = performance.now();
+    const bar = $('#eprog > span');
+    bar.style.width = '0';
+    $('#eprog').classList.add('on');
+    const tick = setInterval(() => {
+      const frac = Math.min(0.9, (performance.now() - t0) / est * 0.9);
+      bar.style.width = (frac * 100).toFixed(1) + '%';
+    }, 100);
     try {
       const r = await fetch('/api/export', {method:'POST', credentials:'same-origin',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({transfer_password:$('#epw').value})});
       if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || r.statusText);
       const blob = await r.blob();
+      localStorage.setItem('exportMs', Math.round(performance.now() - t0));
+      clearInterval(tick); bar.style.width = '100%';
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob); a.download = 'esp32key-export.json'; a.click();
       URL.revokeObjectURL(a.href);
-    } catch(e){ $('#e').textContent = e.message; }
+      $('#exp').disabled = false; exporting = false;
+    } catch(e){
+      clearInterval(tick);
+      $('#eprog').classList.remove('on'); bar.style.width = '0';
+      $('#exp').disabled = false; exporting = false;
+      $('#e').textContent = e.message;
+    }
   };
   $('#imp').onclick = async () => {
     try {
@@ -349,5 +414,17 @@ function renderTransfer() {
   };
 }
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* Generate a random secret using the CSPRNG, with rejection sampling to avoid modulo bias. */
+function genSecret(len) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}';
+  const max = Math.floor(256 / chars.length) * chars.length;   // largest multiple of len that fits in a byte
+  let out = '';
+  const buf = new Uint8Array(1);
+  while (out.length < len) {
+    crypto.getRandomValues(buf);
+    if (buf[0] < max) out += chars[buf[0] % chars.length];
+  }
+  return out;
+}
 boot();
 </script></body></html>
