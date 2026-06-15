@@ -40,7 +40,7 @@ TEST_CASE("add, list, reveal, update, delete round-trip across re-unlock") {
     v.lock();
     CHECK(v.unlock("pw", 2));
 
-    vault_entry_t list[VAULT_MAX_ENTRIES];
+    static vault_entry_t list[VAULT_MAX_ENTRIES];   /* off-stack: ~82 KB at VAULT_MAX_ENTRIES=128 */
     size_t n = v.list(list, VAULT_MAX_ENTRIES);
     CHECK(n == 1);
     CHECK(strcmp(list[0].title, "GitHub") == 0);
@@ -107,7 +107,7 @@ TEST_CASE("export/import round-trips; wrong transfer password rejected") {
     CHECK_FALSE(v.export_bundle("bad", 3, &dummy, &dlen));   // wrong pw
 
     CHECK(v.remove(id));
-    vault_entry_t list[VAULT_MAX_ENTRIES];
+    static vault_entry_t list[VAULT_MAX_ENTRIES];   /* off-stack: ~82 KB at VAULT_MAX_ENTRIES=128 */
     CHECK(v.list(list, VAULT_MAX_ENTRIES) == 0);
 
     CHECK_FALSE(v.import_bundle("wrong", 5, bundle, blen));
@@ -132,7 +132,7 @@ TEST_CASE("import merges by title+username (no duplicate)") {
     CHECK(v.update(id, "Site", "u", "new", "", "", 0));
     CHECK(v.import_bundle("x", 1, bundle, blen));   // old replaces new
 
-    vault_entry_t list[VAULT_MAX_ENTRIES];
+    static vault_entry_t list[VAULT_MAX_ENTRIES];   /* off-stack: ~82 KB at VAULT_MAX_ENTRIES=128 */
     CHECK(v.list(list, VAULT_MAX_ENTRIES) == 1);    // merged, not duplicated
     char sec[VAULT_FIELD_MAX], url[VAULT_FIELD_MAX], comment[VAULT_FIELD_MAX];
     v.reveal(list[0].id, sec, url, comment);
