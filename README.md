@@ -1,4 +1,4 @@
-# esp32key
+# esp32keyManagement
 
 A personal encrypted credential vault that runs on a bare ESP32-S3 dev board.
 You reach it from a browser over HTTPS — on the device's own WiFi hotspot or
