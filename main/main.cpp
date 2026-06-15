@@ -16,7 +16,7 @@
 static const char *TAG = "esp32key";
 
 /* Default AP password — change via Settings after first boot. */
-#define AP_PASSWORD "29028356267034"
+#define AP_PASSWORD "1234567890"
 
 extern "C" void app_main(void)
 {
