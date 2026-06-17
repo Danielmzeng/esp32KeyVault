@@ -8,6 +8,10 @@ to migrate your credentials to another ESP32-S3 or to another password manager.
 
 Built with ESP-IDF v6.0.1.
 
+![esp32key web UI — entries and categories](docs/Screenshots/2-Entries_and_category.png)
+
+*The browser-based vault, unlocked. See the [User Guide](docs/USAGE.md) for a full walkthrough with screenshots.*
+
 ## Features
 
 - Encrypted credential vault: stored secrets are useless without the master
@@ -109,8 +113,13 @@ The first build compiles all of ESP-IDF and can take 10-20 minutes.
 
 ## Usage
 
+For a full walkthrough with screenshots — connecting, first-run setup, unlocking,
+managing credentials, transfer, and settings — see the **[User Guide](docs/USAGE.md)**.
+
+Quick start:
+
 1. Power on the board. Join the WiFi network `esp32key` (default password
-   `esp32key-changeme`), or plug in USB.
+   `1234567890`), or plug in USB.
 2. Browse to `https://192.168.4.1` (WiFi) or `https://10.10.0.1` (USB) and
    accept the certificate warning.
 3. First run: the Setup screen asks for a master password and a transfer
@@ -182,9 +191,7 @@ At the Unity menu, run each suite: `[vault_crypto]`, `[vault_store]`,
 - Decrypted secrets may linger in scratch RAM after lock until overwritten.
 - Export files are plaintext (for portability) — anyone with the file can read
   every secret. Handle and delete them accordingly.
-- No Settings screen yet: the change-master-password API exists but has no UI,
-  and the WiFi AP password is currently hardcoded in `main/main.c`.
 
 ## License
 
-Personal project; no license specified.
+Released under the [MIT License](LICENSE.txt). Copyright (c) 2026 Daniel Zeng.
